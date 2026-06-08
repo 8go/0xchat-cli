@@ -75,11 +75,11 @@ put into the `0xchat-cli` config files.
 
 ## Installation
 
-Copy the script `0xchat-cli` to your computer.
+Copy the script [0xchat-cli](https://github.com/8go/0xchat-cli/blob/main/0xchat-cli) to your computer.
 Most likely you want to copy the 6 config files
-(channels.sh, contacts.sh, identities.sh, open-closed-groups.sh, private-groups.sh, relays.sh)
+(`channels.sh`, `contacts.sh`, `identities.sh`, `open-closed-groups.sh`, `private-groups.sh`, `relays.sh`)
 too if you want to play around seriously.
-The config files add a lot of convenience.
+The config files add a *lot* of convenience.
 
 ## Learn More
 
