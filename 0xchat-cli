@@ -1,0 +1,4488 @@
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+readonly SCRIPT_NAME="0xchat-cli"
+readonly SCRIPT_VERSION="0.37.0"
+readonly DEFAULT_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/0xchat-cli"
+
+# Centralized limits and defaults per Specification
+readonly DEFAULT_GET_LIMIT=20
+readonly MAX_GET_LIMIT=200
+readonly MAX_CONTACT_RECIPIENTS=20
+readonly MAX_GROUP_MEMBERS=20
+readonly MAX_TEXT_MESSAGES=20
+readonly MAX_RELAYS=20
+readonly EXIT_OK=0
+readonly EXIT_ERROR=1
+readonly EXIT_USAGE=2
+readonly EXIT_NOT_IMPLEMENTED=69
+
+# Global state flags
+DEBUG=0
+QUIET=0
+NO_COLOR=0
+JSON=0
+SHOW_HELP=0
+SHOW_VERSION=0
+
+# Command routing
+TOP_COMMAND=""
+VERB=""
+HELP_FUNC=""
+HELP_LEVEL=""
+
+# Config paths (CLI overrides)
+CONFIG_IDENTITIES_PATH=""
+CONFIG_CONTACTS_PATH=""
+CONFIG_RELAYS_PATH=""
+CONFIG_PRIVATE_GROUPS_PATH=""
+CONFIG_CHANNELS_PATH=""
+CONFIG_OPEN_CLOSED_GROUPS_PATH=""
+
+# Config variables (loaded from files)
+# Multi-identity support
+declare -A CONFIG_IDENTITIES_MAP=()
+CONFIG_IDENTITIES_LIST=()
+DEFAULT_IDENTITY=""
+
+# Consolidated private groups support
+declare -A CONFIG_PRIVATE_GROUPS=()
+
+# Legacy/Other configs
+CONFIG_RELAYS=()
+CONFIG_CONTACTS=()
+CONFIG_CHANNELS=()
+CONFIG_NIP29_GROUPS=()
+
+# CLI Override trackers (for replace-on-presence behavior)
+CLI_HAS_NPUBS=0
+CLI_HAS_RELAYS=0
+CLI_HAS_NSEC=0
+CLI_HAS_LIMIT=0
+CLI_HAS_SINCE=0
+CLI_HAS_UNTIL=0
+CLI_HAS_HEX=0
+CLI_HAS_PRIVATE_GROUP_NAME=0
+CLI_HAS_CHANNEL_IDS=0
+CLI_HAS_NIP29_GROUPS=0
+CLI_HAS_EXEC_CMD=0
+
+# Common arguments
+NSEC=""
+PRIVATE_GROUP_NAME=""
+LIMIT=""
+SINCE=""
+UNTIL=""
+HEX_VALUE=""
+NPUBS=()
+RELAYS=()
+TEXTS=()
+TEXT_FILES=()
+TIMESTAMP_VALUE=""
+NEVENTS=()
+CHANNEL_IDS=()
+NIP29_GROUP_IDS=()
+NIP29_RELAY=""
+EXEC_CMD=""
+
+# Profile specific arguments
+PROFILE_NAME=""
+PROFILE_ABOUT=""
+PROFILE_PICTURE=""
+PROFILE_NIP05=""
+PROFILE_LUD16=""
+PROFILE_DISPLAY_NAME=""
+PROFILE_WEBSITE=""
+PROFILE_BANNER=""
+
+# NIP-29 Listen state
+NIP29_RESOLVED_GID=""
+NIP29_RESOLVED_RELAY=""
+NIP29_RESOLVED_TYPE=""
+COMMAND_REST=()
+
+# Colors
+COLOR_RED=""
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_RESET=""
+
+# Global fetch counter for listen loops
+LAST_FETCH_COUNT=0
+
+# Global deduplication tracker for listen loops (prevents NIP-17 randomization duplicates)
+declare -A SEEN_IDS=()
+
+# ==============================================================================
+# Core Utilities & Error Handling
+# ==============================================================================
+
+setup_colors() {
+    if [[ -t 2 && "$NO_COLOR" != "1" ]] && command -v tput > /dev/null 2>&1 && [[ -n "${TERM:-}" && "${TERM}" != "dumb" ]]; then
+        COLOR_RED="$(tput setaf 1)"
+        COLOR_GREEN="$(tput setaf 2)"
+        COLOR_YELLOW="$(tput setaf 3)"
+        COLOR_RESET="$(tput sgr0)"
+    fi
+}
+
+log_debug() {
+    if [[ $DEBUG -eq 1 ]]; then
+        printf '[DEBUG] %s\n' "$*" >&2
+    fi
+}
+
+log_err() {
+    printf '%b[ERROR] %s%b\n' "$COLOR_RED" "$*" "$COLOR_RESET" >&2
+}
+
+trim() {
+    local var="$*"
+    var="${var#"${var%%[![:space:]]*}"}"
+    var="${var%"${var##*[![:space:]]}"}"
+    printf '%s' "$var"
+}
+
+nsec_short() {
+    local value="${1:-}"
+    local len=${#value}
+    if [[ $len -le 11 ]]; then
+        printf '%s' "$value"
+        return 0
+    fi
+    printf '%s...%s' "${value:0:8}" "${value: -3}"
+}
+
+sanitize_args_for_log() {
+    local sanitized=()
+    for arg in "$@"; do
+        if [[ "$arg" == nsec1* || "$arg" == ncryptsec1* ]]; then
+            sanitized+=("$(nsec_short "$arg")")
+        else
+            sanitized+=("$arg")
+        fi
+    done
+    IFS=' '; printf '%s' "${sanitized[*]}" # separate by spaces, default is |
+}
+
+require_bash4_if_needed() {
+    log_debug "Checking Bash version"
+    local major="${BASH_VERSINFO[0]}"
+    local minor="${BASH_VERSINFO[1]}"
+    if (( major < 4 )) || { (( major == 4 )) && (( minor < 0 )); }; then
+        printf '%s: This script requires Bash 4.0+ because it uses associative arrays and modern array features.\n' "$SCRIPT_NAME" >&2
+        printf '%s: Detected Bash %s.%s.\n' "$SCRIPT_NAME" "$major" "$minor" >&2
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Bash version check passed: $major.$minor"
+}
+
+usage_error() {
+    log_err "$1"
+    printf 'Try "%s --help" for more information.\n' "$SCRIPT_NAME" >&2
+    exit "$EXIT_USAGE"
+}
+
+fail() {
+    log_err "$1"
+    exit "$EXIT_ERROR"
+}
+
+check_dependencies() {
+    log_debug "Checking dependencies"
+    local missing=0
+    for cmd in nak jq awk; do
+        if ! command -v "$cmd" > /dev/null 2>&1; then
+            if [[ "$cmd" == "nak" ]]; then
+                log_err "Required command not found: nak"
+                log_err "Please install nak. See: https://github.com/fiatjaf/nak"
+            else
+                log_err "Required command not found: $cmd"
+            fi
+            missing=1
+        else
+            log_debug "$cmd found: $(command -v "$cmd")"
+        fi
+    done
+    if [[ $missing -eq 1 ]]; then
+        fail "Missing required dependencies. Please install them and try again."
+    fi
+}
+
+run_nak() {
+    local stderr_file
+    stderr_file=$(mktemp)
+    log_debug "Running nak: $(sanitize_args_for_log "$@")"
+    local output
+    local status=0
+    output=$("$@" 2>"$stderr_file") || status=$?
+    local err_output
+    err_output=$(<"$stderr_file")
+    rm -f "$stderr_file"
+
+    if [[ $status -ne 0 ]]; then
+        log_err "nak command failed (exit $status): $(sanitize_args_for_log "$@")"
+        if [[ -n "$err_output" ]]; then
+            printf '%b[ERROR] nak stderr: %s%b\n' "$COLOR_RED" "$err_output" "$COLOR_RESET" >&2
+        else
+            printf '%b[ERROR] nak stderr: <empty>%b\n' "$COLOR_RED" "$COLOR_RESET" >&2
+        fi
+        if [[ -n "$output" ]]; then
+            printf '%b[ERROR] nak stdout: %s%b\n' "$COLOR_RED" "$output" "$COLOR_RESET" >&2
+        fi
+        return 1
+    fi
+
+    if [[ -n "$err_output" ]]; then
+        log_err "nak command produced stderr (exit $status): $(sanitize_args_for_log "$@")"
+        printf '%b[ERROR] nak stderr: %s%b\n' "$COLOR_RED" "$err_output" "$COLOR_RESET" >&2
+        if [[ -z "$output" ]]; then
+            return 1
+        fi
+    fi
+
+    local result
+    result=$(printf '%s\n' "$output" | awk 'NF {print $1; exit}')
+    result="$(trim "$result")"
+    if [[ -z "$result" ]]; then
+        log_err "nak command produced empty output: $(sanitize_args_for_log "$@")"
+        return 1
+    fi
+    printf '%s' "$result"
+    return 0
+}
+
+run_nak_full() {
+    local stderr_file
+    stderr_file=$(mktemp)
+    log_debug "Running nak (full): $(sanitize_args_for_log "$@")"
+    local output
+    local status=0
+    output=$("$@" 2>"$stderr_file") || status=$?
+    local err_output
+    err_output=$(<"$stderr_file")
+    rm -f "$stderr_file"
+    # err_output always contains something, even on success it contains: ...connecting ... ok.
+    if [[ "$err_output" == *"failed"* ]] || [[ "$err_output" == *"blocked"* ]] || \
+       [[ "$err_output" == *"restricted"* ]]  || [[ "$err_output" == *"unknown member"* ]] || \
+       [[ "$err_output" == *"not a member"* ]]; then
+        log_err "nak command failed (exit $status): $(sanitize_args_for_log "$@")"
+        # log_err "nak command failed (exit $status): stderr: $err_output"
+        printf '%b[ERROR] nak stderr: %s%b\n' "$COLOR_RED" "$err_output" "$COLOR_RESET" >&2
+        return 1
+    fi
+    if [[ $status -ne 0 ]]; then
+        log_err "nak command failed (exit $status): $(sanitize_args_for_log "$@")"
+        if [[ -n "$err_output" ]]; then
+            printf '%b[ERROR] nak stderr: %s%b\n' "$COLOR_RED" "$err_output" "$COLOR_RESET" >&2
+        fi
+        return 1
+    fi
+    printf '%s' "$output"
+    return 0
+}
+
+print_debug_args() {
+    if [[ $DEBUG -eq 1 ]]; then
+        log_debug "--- Parsed State Dump ---"
+        log_debug "TOP_COMMAND: ${TOP_COMMAND:-<unset>}"
+        log_debug "VERB: ${VERB:-<unset>}"
+        log_debug "JSON: $JSON | QUIET: $QUIET | NO_COLOR: $NO_COLOR"
+        log_debug "CONFIG_IDENTITIES_PATH: ${CONFIG_IDENTITIES_PATH:-<unset>}"
+        log_debug "CONFIG_CONTACTS_PATH: ${CONFIG_CONTACTS_PATH:-<unset>}"
+        log_debug "CONFIG_RELAYS_PATH: ${CONFIG_RELAYS_PATH:-<unset>}"
+        log_debug "CONFIG_PRIVATE_GROUPS_PATH: ${CONFIG_PRIVATE_GROUPS_PATH:-<unset>}"
+        log_debug "CONFIG_CHANNELS_PATH: ${CONFIG_CHANNELS_PATH:-<unset>}"
+        log_debug "CONFIG_OPEN_CLOSED_GROUPS_PATH: ${CONFIG_OPEN_CLOSED_GROUPS_PATH:-<unset>}"
+        if [[ -n "$NSEC" ]]; then
+            log_debug "NSEC: $(nsec_short "$NSEC")"
+        else
+            log_debug "NSEC: <unset>"
+        fi
+        log_debug "PRIVATE_GROUP_NAME: ${PRIVATE_GROUP_NAME:-<unset>}"
+        log_debug "LIMIT: ${LIMIT:-<unset>}"
+        log_debug "SINCE: ${SINCE:-<unset>}"
+        log_debug "UNTIL: ${UNTIL:-<unset>}"
+        log_debug "HEX_VALUE: ${HEX_VALUE:-<unset>}"
+        if [[ ${#NPUBS[@]} -gt 0 ]]; then log_debug "NPUBS: ${NPUBS[*]}"; fi
+        if [[ ${#RELAYS[@]} -gt 0 ]]; then log_debug "RELAYS: ${RELAYS[*]}"; fi
+        if [[ ${#TEXTS[@]} -gt 0 ]]; then log_debug "TEXTS: ${TEXTS[*]}"; fi
+        if [[ ${#TEXT_FILES[@]} -gt 0 ]]; then log_debug "TEXT_FILES: ${TEXT_FILES[*]}"; fi
+        if [[ ${#NEVENTS[@]} -gt 0 ]]; then log_debug "NEVENTS: ${NEVENTS[*]}"; fi
+        if [[ ${#CHANNEL_IDS[@]} -gt 0 ]]; then log_debug "CHANNEL_IDS: ${CHANNEL_IDS[*]}"; fi
+        if [[ ${#NIP29_GROUP_IDS[@]} -gt 0 ]]; then log_debug "NIP29_GROUP_IDS: ${NIP29_GROUP_IDS[*]}"; fi
+        if [[ -n "$NIP29_RELAY" ]]; then log_debug "NIP29_RELAY: $NIP29_RELAY"; fi
+        if [[ -n "$EXEC_CMD" ]]; then log_debug "EXEC_CMD: $EXEC_CMD"; fi
+        if [[ ${#CONFIG_CONTACTS[@]} -gt 0 ]]; then log_debug "CONFIG_CONTACTS: ${#CONFIG_CONTACTS[@]} entries"; fi
+        if [[ ${#CONFIG_CHANNELS[@]} -gt 0 ]]; then log_debug "CONFIG_CHANNELS: ${#CONFIG_CHANNELS[@]} entries"; fi
+        if [[ ${#CONFIG_NIP29_GROUPS[@]} -gt 0 ]]; then log_debug "CONFIG_NIP29_GROUPS: ${#CONFIG_NIP29_GROUPS[@]} entries"; fi
+        log_debug "-------------------------"
+    fi
+}
+
+not_implemented() {
+    print_debug_args
+    log_err "This command is not yet implemented."
+    printf '%s: Contributions are welcome: please open a PR.\n' "$SCRIPT_NAME" >&2
+    exit "$EXIT_NOT_IMPLEMENTED"
+}
+
+# ==============================================================================
+# Timestamp Resolution (Auto-detect Unix vs Human/Relative via GNU date)
+# ==============================================================================
+
+resolve_timestamp_to_unix() {
+    local input="$1"
+    input="$(trim "$input")"
+
+    # Pure digits -> Unix timestamp
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        local len=${#input}
+        if [[ $len -ge 13 ]]; then
+            # Milliseconds (or higher precision) to seconds
+            printf '%s' "${input:0:10}"
+            return 0
+        else
+            # Seconds (handles 0, short timestamps, and standard 10-digit)
+            printf '%s' "$input"
+            return 0
+        fi
+    fi
+
+    # Human/Relative string -> GNU date
+    local unix_ts
+    if unix_ts=$(date -d "$input" +%s 2>/dev/null); then
+        printf '%s' "$unix_ts"
+        return 0
+    fi
+
+    log_err "Failed to parse timestamp (requires GNU date for relative strings): $input"
+    return 1
+}
+
+resolve_timestamp_to_human() {
+    local unix_ts="$1"
+    local human
+    if human=$(date -d "@$unix_ts" "+%Y-%m-%d %H:%M:%S %Z" 2>/dev/null); then
+        printf '%s' "$human"
+        return 0
+    fi
+    printf '%s' "$unix_ts"
+    return 1
+}
+
+# ==============================================================================
+# Identity & Key Resolution (v0.31.0+ Multi-Identity Support)
+# ==============================================================================
+
+# Resolves an identity token (alias, nsec1..., or 64-char hex) to a valid nsec1...
+# Checks CONFIG_IDENTITIES_MAP first, then attempts direct conversion.
+resolve_identity_token() {
+    local token="$1"
+    local trimmed
+    trimmed="$(trim "$token")"
+
+    # 1. Check alias in loaded identities map
+    if [[ ${#CONFIG_IDENTITIES_MAP[@]} -gt 0 ]]; then
+        local mapped_val="${CONFIG_IDENTITIES_MAP[$trimmed]:-}"
+        if [[ -n "$mapped_val" ]]; then
+            log_debug "Resolved identity alias '$trimmed' -> $(nsec_short "$mapped_val")"
+            # Recursively resolve in case map points to hex or another format
+            resolve_identity_token "$mapped_val"
+            return $?
+        fi
+    fi
+
+    # 2. Literal nsec
+    if [[ "$trimmed" == nsec1* ]]; then
+        log_debug "Using literal nsec: $(nsec_short "$trimmed")"
+        printf '%s' "$trimmed"
+        return 0
+    fi
+
+    # 3. 64-char private hex
+    if [[ ${#trimmed} -eq 64 && "$trimmed" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        log_debug "Encoding private hex to nsec"
+        local encoded
+        if encoded=$(run_nak nak encode nsec "$trimmed"); then
+            log_debug "Encoded private hex -> $(nsec_short "$encoded")"
+            printf '%s' "$encoded"
+            return 0
+        fi
+        log_err "Failed to encode private hex to nsec"
+        return 1
+    fi
+
+    log_err "Unrecognized identity format: '$trimmed'. Not a known alias, nsec1..., or 64-char hex."
+    return 1
+}
+
+resolve_and_set_nsec() {
+    local token="$1"
+    local resolved
+    if ! resolved=$(resolve_identity_token "$token"); then
+        usage_error "Failed to resolve --nsec value: $token"
+    fi
+    NSEC="$resolved"
+}
+
+# Determines the active NSEC based on precedence:
+# 1. CLI --nsec (already set in NSEC if provided)
+# 2. DEFAULT_IDENTITY from identities.sh
+# 3. First entry in CONFIG_IDENTITIES_LIST
+resolve_active_nsec_from_config() {
+    # If CLI already set it, do nothing
+    if [[ -n "$NSEC" ]]; then
+        return 0
+    fi
+
+    # Try DEFAULT_IDENTITY
+    if [[ -n "$DEFAULT_IDENTITY" ]]; then
+        log_debug "Resolving DEFAULT_IDENTITY: $DEFAULT_IDENTITY"
+        local resolved
+        if resolved=$(resolve_identity_token "$DEFAULT_IDENTITY"); then
+            NSEC="$resolved"
+            log_debug "Active NSEC set from DEFAULT_IDENTITY: $(nsec_short "$NSEC")"
+            return 0
+        else
+            log_err "Failed to resolve DEFAULT_IDENTITY '$DEFAULT_IDENTITY'"
+            return 1
+        fi
+    fi
+
+    # Fallback to first identity in list
+    if [[ ${#CONFIG_IDENTITIES_LIST[@]} -gt 0 ]]; then
+        local first_entry="${CONFIG_IDENTITIES_LIST[0]}"
+        local first_key="${first_entry#*|}"
+        log_debug "Falling back to first identity in list: $(nsec_short "$first_key")"
+        local resolved
+        if resolved=$(resolve_identity_token "$first_key"); then
+            NSEC="$resolved"
+            return 0
+        fi
+    fi
+
+    # No identity found at all - this is OK at load time; require_nsec will catch it later
+    log_debug "No active NSEC determined from config"
+    return 0
+}
+
+# ==============================================================================
+# NPUB Resolution (alias → NIP-05 → hex → npub)
+# ==============================================================================
+
+resolve_npub_token() {
+    local token="$1"
+    local trimmed
+    trimmed="$(trim "$token")"
+
+    # 1. Alias lookup
+    for entry in "${CONFIG_CONTACTS[@]}"; do
+        if [[ "$entry" == *"|"* ]]; then
+            local alias_name="${entry%%|*}"
+            local contact_npub="${entry#*|}"
+            if [[ "$alias_name" == "$trimmed" ]]; then
+                log_debug "Resolved alias '$trimmed' -> $contact_npub"
+                printf '%s' "$contact_npub"
+                return 0
+            fi
+        fi
+    done
+
+    # 2. NIP-05
+    if [[ "$trimmed" == *@*.* ]]; then
+        log_debug "Resolving NIP-05: $trimmed"
+        local nip_hex nip_npub
+        if nip_hex=$(run_nak nak decode "$trimmed" 2>/dev/null) && nip_npub=$(run_nak nak encode npub "$nip_hex"); then
+            log_debug "Resolved NIP-05 '$trimmed' -> $nip_npub"
+            printf '%s' "$nip_npub"
+            return 0
+        fi
+        log_err "Failed to resolve NIP-05: $trimmed"
+        return 1
+    fi
+
+    # 3. Public hex
+    if [[ ${#trimmed} -eq 64 && "$trimmed" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        local hex_npub
+        if hex_npub=$(run_nak nak encode npub "$trimmed"); then
+            log_debug "Encoded public hex -> $hex_npub"
+            printf '%s' "$hex_npub"
+            return 0
+        fi
+        log_err "Failed to encode public hex: $trimmed"
+        return 1
+    fi
+
+    log_debug "Using npub token: $trimmed"
+    printf '%s' "$trimmed"
+}
+
+resolve_and_append_npub() {
+    local token="$1"
+    local resolved
+    if ! resolved=$(resolve_npub_token "$token"); then
+        usage_error "Failed to resolve --npub value: $token"
+    fi
+    NPUBS+=("$resolved")
+}
+
+resolve_token_to_hex() {
+    local token="$1"
+    local resolved_npub hex
+    resolved_npub=$(resolve_npub_token "$token") || return 1
+    hex=$(run_nak nak decode "$resolved_npub") || return 1
+    printf '%s' "$hex"
+}
+
+resolve_all_contacts_to_hex() {
+    local hexes=()
+    for entry in "${CONFIG_CONTACTS[@]}"; do
+        local npub_val
+        if [[ "$entry" == *"|"* ]]; then
+            npub_val="${entry#*|}"
+        else
+            npub_val="$entry"
+        fi
+        local hex
+        if hex=$(run_nak nak decode "$npub_val" 2>/dev/null); then
+            hexes+=("$hex")
+        else
+            log_debug "Failed to decode contact npub: $npub_val"
+        fi
+    done
+    printf '%s\n' "${hexes[@]}"
+}
+
+lookup_alias_for_hex() {
+    local target_hex="$1"
+    for entry in "${CONFIG_CONTACTS[@]}"; do
+        if [[ "$entry" == *"|"* ]]; then
+            local alias_name="${entry%%|*}"
+            local contact_npub="${entry#*|}"
+            local contact_hex
+            contact_hex=$(run_nak nak decode "$contact_npub" 2>/dev/null) || continue
+            if [[ "$contact_hex" == "$target_hex" ]]; then
+                printf '%s' "$alias_name"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+format_sender_label() {
+    local pubkey="$1"
+    local label=""
+    if [[ -n "$pubkey" ]]; then
+        label=$(lookup_alias_for_hex "$pubkey" 2>/dev/null) || label=""
+    fi
+
+    if [[ -n "$label" ]]; then
+        # Alias available: truncate to 10 + "..." if > 13 chars
+        if [[ ${#label} -gt 13 ]]; then
+            label="${label:0:10}..."
+        fi
+    else
+        # No alias: use shortened npub (e.g., npub1ab...xyz) to exactly 13 chars
+        local npub
+        npub=$(run_nak nak encode npub "$pubkey" 2>/dev/null) || npub="$pubkey"
+        if [[ "$npub" == npub1* && ${#npub} -ge 13 ]]; then
+            label="${npub:0:7}...${npub: -3}"
+        else
+            label="${npub:0:10}..."
+        fi
+    fi
+
+    # Pad or truncate to exactly 13 characters
+    printf '%-13.13s' "$label"
+}
+
+# ==============================================================================
+# Channel Resolution (alias → nevent → hex)
+# ==============================================================================
+
+resolve_channel_token() {
+    local token="$1"
+    local trimmed
+    trimmed="$(trim "$token")"
+
+    # 1. Alias lookup
+    for entry in "${CONFIG_CHANNELS[@]}"; do
+        if [[ "$entry" == *"|"* ]]; then
+            local alias_name="${entry%%|*}"
+            local channel_val="${entry#*|}"
+            if [[ "$alias_name" == "$trimmed" ]]; then
+                log_debug "Resolved channel alias '$trimmed' -> $channel_val"
+                trimmed="$channel_val"
+                break
+            fi
+        fi
+    done
+
+    # 2. NIP-19 nevent
+    if [[ "$trimmed" == nostr:nevent1* || "$trimmed" == nevent1* ]]; then
+        log_debug "Decoding nevent: $trimmed"
+        local decoded
+        if decoded=$(run_nak_full nak decode "$trimmed"); then
+            local id
+            id=$(printf '%s' "$decoded" | jq -r '.id // empty')
+            if [[ -n "$id" ]]; then
+                printf '%s' "$id"
+                return 0
+            fi
+        fi
+        log_err "Failed to decode nevent: $trimmed"
+        return 1
+    fi
+
+    # 3. Raw hex
+    if [[ ${#trimmed} -eq 64 && "$trimmed" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        printf '%s' "$trimmed"
+        return 0
+    fi
+
+    log_err "Unrecognized channel-id format: $trimmed"
+    return 1
+}
+
+# ==============================================================================
+# NIP-29 Group Resolution (alias → group-id + relay)
+# ==============================================================================
+
+resolve_nip29_group() {
+    local token="$1" # alias or group-id or nostr:naddr1... or addr1...
+    local fallback_type="$2"
+    local trimmed
+    trimmed="$(trim "$token")"
+
+    log_debug "resolve_nip29_group: check first if $trimmed is an naddr1 object."
+    if [[ "$trimmed" == nostr:naddr* || "$trimmed" == naddr* ]]; then
+	if ! output=$(_event_decode "$trimmed"); then
+	  log_debug "Could not decode naddr1. This is probably going to fail."
+        else
+	  local type="" gid="" relay=""
+	  # identifier and first relay
+	  gid=$(jq -r '.identifier' <<<"$output")
+	  relay=$(jq -r '.relays[0]' <<<"$output")
+          type="$fallback_type"
+          printf '%s|%s|%s' "$type" "$gid" "$relay"
+          return 0
+        fi
+    fi
+
+    log_debug "resolve_nip29_group: trying to look up id or alias $trimmed in CONFIG_NIP29_GROUPS array."
+    # Lookup in config
+    # The user can either give ALIAS of group or GROUP-ID (which is the gid in the array)
+    # One has to go through the array and try to find this alias or this gid.
+    # If found extract the other values: type, relay.
+    # The return all 3: type, gid, relay.
+    for entry in "${CONFIG_NIP29_GROUPS[@]}"; do
+        local IFS='|'
+        read -ra parts <<< "$entry"
+        local alias="" type="" gid="" relay=""
+        if [[ ${#parts[@]} -eq 4 ]]; then
+            alias="${parts[0]}"
+            type="${parts[1]}"
+            gid="${parts[2]}"
+            relay="${parts[3]}"
+        elif [[ ${#parts[@]} -eq 3 ]]; then
+            type="${parts[0]}"
+            gid="${parts[1]}"
+            relay="${parts[2]}"
+        fi
+        if [[ -n "$alias" && "$alias" == "$trimmed" ]] || [[ "$gid" == "$trimmed" ]]; then
+            printf '%s|%s|%s' "$type" "$gid" "$relay"
+            return 0
+        fi
+    done
+
+    log_err "Unrecognized NIP-29 group: must be Alias, hex Group-Id, nostr:naddr1 object: found $trimmed"
+    return 1
+}
+
+# ==============================================================================
+# Validation Requirements
+# ==============================================================================
+
+require_nsec() {
+    log_debug "Checking requirement: nsec"
+    if [[ -z "$NSEC" ]]; then
+        usage_error "nsec not set. Provide --nsec, set DEFAULT_IDENTITY in identities.sh, or add identities to CONFIG_IDENTITIES."
+    fi
+}
+
+require_npub() {
+    log_debug "Checking requirement: npub"
+    if [[ ${#NPUBS[@]} -eq 0 ]]; then
+        if [[ "$TOP_COMMAND" == "key" ]]; then
+            usage_error "npub not set, provide option --npub"
+        else
+            usage_error "recipient/member not set, provide --npub or configure private-groups.sh"
+        fi
+    fi
+}
+
+require_text() {
+    log_debug "Checking requirement: text"
+    if [[ ${#TEXTS[@]} -eq 0 && ${#TEXT_FILES[@]} -eq 0 ]]; then
+        usage_error "message not set, provide --text or --text-file"
+    fi
+}
+
+require_hex() {
+    log_debug "Checking requirement: hex"
+    if [[ -z "$HEX_VALUE" ]]; then
+        usage_error "hex not set, provide option --hex"
+    fi
+}
+
+require_private_group_name() {
+    log_debug "Checking requirement: group-name"
+    if [[ -z "$PRIVATE_GROUP_NAME" ]]; then
+        usage_error "group-name not set, provide option --group-name"
+    fi
+}
+
+require_npub_or_nsec() {
+    log_debug "Checking requirement: npub or nsec"
+    if [[ ${#NPUBS[@]} -eq 0 && -z "$NSEC" ]]; then
+        usage_error "identity not set, provide --npub, --nsec, or configure identities.sh"
+    fi
+}
+
+require_relays() {
+    log_debug "Checking requirement: relays"
+    if [[ ${#RELAYS[@]} -eq 0 ]]; then
+        usage_error "no relays configured, provide --relay (1 or more times) or configure relays.sh"
+    fi
+}
+
+# ==============================================================================
+# Configuration Loading (Multi-Layer System v0.31.0+)
+# ==============================================================================
+
+validate_explicit_configs() {
+    log_debug "Entering validate_explicit_configs"
+    if [[ -n "$CONFIG_IDENTITIES_PATH" && ! -f "$CONFIG_IDENTITIES_PATH" ]]; then
+        usage_error "Identities config file not found: $CONFIG_IDENTITIES_PATH"
+    fi
+    if [[ -n "$CONFIG_CONTACTS_PATH" && ! -f "$CONFIG_CONTACTS_PATH" ]]; then
+        usage_error "Contacts config file not found: $CONFIG_CONTACTS_PATH"
+    fi
+    if [[ -n "$CONFIG_RELAYS_PATH" && ! -f "$CONFIG_RELAYS_PATH" ]]; then
+        usage_error "Relays config file not found: $CONFIG_RELAYS_PATH"
+    fi
+    if [[ -n "$CONFIG_PRIVATE_GROUPS_PATH" && ! -f "$CONFIG_PRIVATE_GROUPS_PATH" ]]; then
+        usage_error "Private groups config file not found: $CONFIG_PRIVATE_GROUPS_PATH"
+    fi
+    if [[ -n "$CONFIG_CHANNELS_PATH" && ! -f "$CONFIG_CHANNELS_PATH" ]]; then
+        usage_error "Channels config file not found: $CONFIG_CHANNELS_PATH"
+    fi
+    if [[ -n "$CONFIG_OPEN_CLOSED_GROUPS_PATH" && ! -f "$CONFIG_OPEN_CLOSED_GROUPS_PATH" ]]; then
+        usage_error "NIP-29 groups config file not found: $CONFIG_OPEN_CLOSED_GROUPS_PATH"
+    fi
+    log_debug "Exiting validate_explicit_configs"
+}
+
+load_configs() {
+    log_debug "Entering load_configs"
+
+    # 1. Identities (NEW v0.31.0)
+    local identities_file="${CONFIG_IDENTITIES_PATH:-$DEFAULT_CONFIG_DIR/identities.sh}"
+    if [[ -f "$identities_file" ]]; then
+        log_debug "Sourcing identities config: $identities_file"
+        source "$identities_file"
+
+        # Populate map and list from CONFIG_IDENTITIES array defined in file
+        if [[ ${#CONFIG_IDENTITIES[@]} -gt 0 ]]; then
+            for entry in "${CONFIG_IDENTITIES[@]}"; do
+                if [[ "$entry" == *"|"* ]]; then
+                    local alias="${entry%%|*}"
+                    local key="${entry#*|}"
+                    CONFIG_IDENTITIES_MAP["$alias"]="$key"
+                    CONFIG_IDENTITIES_LIST+=("$entry")
+                    log_debug "  Identity: $alias -> $(nsec_short "$key")"
+                else
+                    log_debug "  Identity (no alias): $(nsec_short "$entry")"
+                    CONFIG_IDENTITIES_LIST+=("$entry")
+                fi
+            done
+        fi
+
+        if [[ -n "${DEFAULT_IDENTITY:-}" ]]; then
+            log_debug "DEFAULT_IDENTITY: $DEFAULT_IDENTITY"
+        fi
+
+        # Resolve active NSEC from config if CLI hasn't set it
+        resolve_active_nsec_from_config
+    else
+        log_debug "Identities config not found: $identities_file"
+    fi
+
+    # 2. Contacts
+    local contacts_file="${CONFIG_CONTACTS_PATH:-$DEFAULT_CONFIG_DIR/contacts.sh}"
+    if [[ -f "$contacts_file" ]]; then
+        log_debug "Sourcing contacts config: $contacts_file"
+        source "$contacts_file"
+        local contact_count=${#CONFIG_CONTACTS[@]}
+        log_debug "Contacts loaded: $contact_count entries"
+        if [[ $contact_count -gt 0 ]]; then
+            for entry in "${CONFIG_CONTACTS[@]}"; do
+                if [[ "$entry" == *"|"* ]]; then
+                    local alias_name="${entry%%|*}"
+                    local contact_npub="${entry#*|}"
+                    log_debug "  Contact: $alias_name -> $contact_npub"
+                else
+                    log_debug "  Contact: $entry (no alias)"
+                fi
+            done
+        fi
+    else
+        log_debug "Contacts config not found: $contacts_file"
+    fi
+
+    # 3. Relays
+    local relays_file="${CONFIG_RELAYS_PATH:-$DEFAULT_CONFIG_DIR/relays.sh}"
+    if [[ -f "$relays_file" ]]; then
+        log_debug "Sourcing relays config: $relays_file"
+        source "$relays_file"
+        local relay_count=${#CONFIG_RELAYS[@]}
+        log_debug "Relays loaded: $relay_count entries"
+        if [[ $relay_count -gt 0 && ${#RELAYS[@]} -eq 0 ]]; then
+            for r in "${CONFIG_RELAYS[@]}"; do
+                r="$(trim "$r")"
+                RELAYS+=("$r")
+                log_debug "  Relay: $r"
+            done
+        fi
+    else
+        log_debug "Relays config not found: $relays_file"
+    fi
+
+    # 4. Private Groups (NEW v0.31.0 - Consolidated)
+    local private_groups_file="${CONFIG_PRIVATE_GROUPS_PATH:-$DEFAULT_CONFIG_DIR/private-groups.sh}"
+    if [[ -f "$private_groups_file" ]]; then
+        log_debug "Sourcing private-groups config: $private_groups_file"
+        source "$private_groups_file"
+
+        # CONFIG_PRIVATE_GROUPS associative array is now populated from file
+        if [[ ${#CONFIG_PRIVATE_GROUPS[@]} -gt 0 ]]; then
+            log_debug "Private groups loaded: ${#CONFIG_PRIVATE_GROUPS[@]} groups"
+            for gname in "${!CONFIG_PRIVATE_GROUPS[@]}"; do
+                local var_name="${CONFIG_PRIVATE_GROUPS[$gname]}"
+                log_debug "  Group: '$gname' -> \$$var_name"
+            done
+        fi
+    else
+        log_debug "Private groups config not found: $private_groups_file"
+    fi
+
+    # 5. Channels (NIP-28)
+    local channels_file="${CONFIG_CHANNELS_PATH:-$DEFAULT_CONFIG_DIR/channels.sh}"
+    if [[ -f "$channels_file" ]]; then
+        log_debug "Sourcing channels config: $channels_file"
+        source "$channels_file"
+        local channel_count=${#CONFIG_CHANNELS[@]}
+        log_debug "Channels loaded: $channel_count entries"
+        if [[ $channel_count -gt 0 ]]; then
+            for entry in "${CONFIG_CHANNELS[@]}"; do
+                if [[ "$entry" == *"|"* ]]; then
+                    local alias_name="${entry%%|*}"
+                    local channel_val="${entry#*|}"
+                    log_debug "  Channel: $alias_name -> $channel_val"
+                else
+                    log_debug "  Channel: $entry (no alias)"
+                fi
+            done
+        fi
+    else
+        log_debug "Channels config not found: $channels_file"
+    fi
+
+    # 6. NIP-29 Groups (Open/Closed)
+    local nip29_file="${CONFIG_OPEN_CLOSED_GROUPS_PATH:-$DEFAULT_CONFIG_DIR/open-closed-groups.sh}"
+    if [[ -f "$nip29_file" ]]; then
+        log_debug "Sourcing NIP-29 groups config: $nip29_file"
+        source "$nip29_file"
+        local group_count=${#CONFIG_NIP29_GROUPS[@]}
+        log_debug "NIP-29 groups loaded: $group_count entries"
+        if [[ $group_count -gt 0 ]]; then
+            for entry in "${CONFIG_NIP29_GROUPS[@]}"; do
+                local IFS='|'
+                read -ra parts <<< "$entry"
+                if [[ ${#parts[@]} -eq 4 ]]; then
+                    log_debug "  Group: ${parts[0]} (${parts[1]}) -> ${parts[2]} @ ${parts[3]}"
+                elif [[ ${#parts[@]} -eq 3 ]]; then
+                    log_debug "  Group: (${parts[0]}) -> ${parts[1]} @ ${parts[2]}"
+                fi
+            done
+        fi
+    else
+        log_debug "NIP-29 groups config not found: $nip29_file"
+    fi
+
+    log_debug "Exiting load_configs"
+}
+
+# ==============================================================================
+# Help Functions (Full Versions with --exec documentation)
+# ==============================================================================
+
+print_help_top() {
+    cat <<EOF
+${SCRIPT_NAME} ${SCRIPT_VERSION}
+
+Usage: ${SCRIPT_NAME} [global-options] <command> [<verb>] [options]
+
+Top-level commands:
+  help                 Show this help
+  version              Print version
+  timestamp            Convert between Unix and human-readable timestamps
+  key                  Key management (generate, convert, derive)
+  event                Decode NIP-19 nevent entities
+  profile              Profile metadata (get, set)
+  contact              Direct messages (send, get, listen)
+  private-group        NIP-17 encrypted groups (send, get, listen)
+  open-group           NIP-29 open groups (send, get, listen)
+  closed-group         NIP-29 closed groups (send, get, listen)
+  public-channel       NIP-28 public channels (send, get, listen)
+  post                 Public notes (send, get, listen)
+  self-test            Run automated self-tests
+
+Global Options:
+  -h, --help                        Show help
+  -v, --version                     Print version
+  -d, --debug                       Enable debug output
+  -q, --quiet                       Suppress informational output
+  --no-color                        Disable colors
+  --json                            Output JSON
+  --config-identities PATH          Identities config file (multi-user)
+  --config-contacts PATH            Contacts config file
+  --config-relays PATH              Relays config file
+  --config-private-groups PATH      Private groups config file (NIP-17)
+  --config-channels PATH            Channels config file (NIP-28)
+  --config-open-closed-groups PATH  NIP-29 groups config file
+
+Identity Resolution:
+  --nsec VALUE               Accepts alias, nsec1..., OR 64-char private hex.
+                             Aliases are resolved from identities.sh.
+                             Private hex is automatically encoded to nsec.
+
+  --npub VALUE               Accepts any of:
+                             - npub1... (literal bech32)
+                             - 64-char public hex (auto-encoded to npub)
+                             - NIP-05 identifier (e.g. user@example.com)
+                             - Alias name from contacts.sh
+
+Requirements:
+  - nak (https://github.com/fiatjaf/nak) [This is also the only connection to the Internet.]
+  - jq
+  - awk
+  - GNU date (for relative time parsing like "1 hour ago")
+
+Run '${SCRIPT_NAME} <command> --help' for more information on a command.
+Run '${SCRIPT_NAME} <command> <verb> --help' for more information on a verb.
+
+Notes:
+  - This tool is intended to be used as a companion CLI, admin app, bot tool,
+    or AI access to the lovely 0xchat app, see
+    https://www.0xchat.com/ and https://github.com/0xchat-app.
+  - This tool is purposefully only one file, one Bash v4+ script to be exact, for
+    simplicity of installation and portability.
+  - This tool does not connect to the internet ever, except for the needed
+    invocations of the "nak" tool to contact the user provided Nostr relays.
+  - This tool is incomplete. The full CLI has not been implemented. Therefore,
+    contributions are welcome. But there is enough functionality there to run a
+    trivial bot on a home server for a few friends.
+EOF
+}
+
+print_help_event() {
+    cat <<EOF
+${SCRIPT_NAME} event
+
+Usage: ${SCRIPT_NAME} event [options] <nevent1...>
+
+Decode NIP-19 nevent formatted event-ids into human readable JSON objects.
+Accepts one or more nevents via --nevent or as positional arguments.
+
+Examples:
+  ${SCRIPT_NAME} event --nevent nostr:nevent1qqsfk5u0w...
+  ${SCRIPT_NAME} event nostr:nevent1abc... nostr:nevent1def...
+  ${SCRIPT_NAME} event --nevent nevent1xyz... --json
+
+Options:
+  --nevent NEVENT        NIP-19 nevent to decode (repeatable)
+  --json                 Output as a JSON array
+  -h, --help             Show help
+EOF
+}
+
+print_help_timestamp() {
+    cat <<EOF
+${SCRIPT_NAME} timestamp
+
+Usage: ${SCRIPT_NAME} timestamp <value>
+
+Convert between Unix timestamps and human-readable dates.
+Auto-detects the input format:
+  - Pure digits (10 or 13 chars): Treated as Unix timestamp (seconds or ms).
+  - Anything else: Treated as human date, ISO 8601, or relative time (requires GNU date).
+
+Examples:
+  ${SCRIPT_NAME} timestamp 1779887279
+  ${SCRIPT_NAME} timestamp "2026-05-27 18:03:17"
+  ${SCRIPT_NAME} timestamp "1 hour ago"
+  ${SCRIPT_NAME} timestamp "yesterday"
+  ${SCRIPT_NAME} timestamp "2026-05-27T18:03:17Z"
+
+Options:
+  --json                 Output JSON
+  -h, --help             Show help
+EOF
+}
+
+print_help_key() {
+    cat <<EOF
+${SCRIPT_NAME} key
+
+Usage: ${SCRIPT_NAME} key <verb> [options]
+
+Verbs:
+  generate               Generate a new keypair
+  convert-nsec-to-hex    Convert nsec to private hex
+  convert-npub-to-hex    Convert npub to public hex
+  convert-hex-to-nsec    Convert private hex to nsec
+  convert-hex-to-npub    Convert public hex to npub
+  derive-npub            Derive npub from nsec
+  derive-public-hex      Derive public hex from nsec
+
+Run '${SCRIPT_NAME} key <verb> --help' for more information on a verb.
+EOF
+}
+
+print_help_key_generate() {
+    cat <<EOF
+${SCRIPT_NAME} key generate
+
+Usage: ${SCRIPT_NAME} key generate [options]
+
+Generate a new keypair.
+
+Options:
+  --json                 Output JSON (nsec, private_hex, npub, public_hex)
+  -h, --help             Show help
+EOF
+}
+
+print_help_key_convert_nsec_to_hex() {
+    cat <<EOF
+${SCRIPT_NAME} key convert-nsec-to-hex
+
+Usage: ${SCRIPT_NAME} key convert-nsec-to-hex [options]
+
+Convert nsec to private hex.
+
+Options:
+  --nsec NSEC            Secret key in nsec form (or private hex, or alias)
+  -h, --help             Show help
+EOF
+}
+
+print_help_key_convert_npub_to_hex() {
+    cat <<EOF
+${SCRIPT_NAME} key convert-npub-to-hex
+
+Usage: ${SCRIPT_NAME} key convert-npub-to-hex [options]
+
+Convert npub to public hex.
+
+Options:
+  --npub NPUB            Public key (npub, hex, alias, or NIP-5)
+  -h, --help             Show help
+EOF
+}
+
+print_help_key_convert_hex_to_nsec() {
+    cat <<EOF
+${SCRIPT_NAME} key convert-hex-to-nsec
+
+Usage: ${SCRIPT_NAME} key convert-hex-to-nsec [options]
+
+Convert private hex to nsec.
+
+Options:
+  --hex HEX              Hex value
+  -h, --help             Show help
+EOF
+}
+
+print_help_key_convert_hex_to_npub() {
+    cat <<EOF
+${SCRIPT_NAME} key convert-hex-to-npub
+
+Usage: ${SCRIPT_NAME} key convert-hex-to-npub [options]
+
+Convert public hex to npub.
+
+Options:
+  --hex HEX              Hex value
+  -h, --help             Show help
+EOF
+}
+
+print_help_key_derive_npub() {
+    cat <<EOF
+${SCRIPT_NAME} key derive-npub
+
+Usage: ${SCRIPT_NAME} key derive-npub [options]
+
+Derive npub from nsec.
+
+Options:
+  --nsec NSEC            Secret key in nsec form (or private hex, or alias)
+  -h, --help             Show help
+EOF
+}
+
+print_help_key_derive_public_hex() {
+    cat <<EOF
+${SCRIPT_NAME} key derive-public-hex
+
+Usage: ${SCRIPT_NAME} key derive-public-hex [options]
+
+Derive public hex from nsec.
+
+Options:
+  --nsec NSEC            Secret key in nsec form (or private hex, or alias)
+  -h, --help             Show help
+EOF
+}
+
+print_help_profile() {
+    cat <<EOF
+${SCRIPT_NAME} profile
+
+Usage: ${SCRIPT_NAME} profile <verb> [options]
+
+Verbs:
+  get                    Fetch profile metadata
+  set                    Set profile metadata
+
+Run '${SCRIPT_NAME} profile <verb> --help' for more information on a verb.
+EOF
+}
+
+print_help_profile_get() {
+    cat <<EOF
+${SCRIPT_NAME} profile get
+
+Usage: ${SCRIPT_NAME} profile get [options]
+
+Fetch profile metadata (kind 0).
+
+Options:
+  --npub NPUB            Filter by author (repeatable; accepts npub, hex, alias, NIP-05; omit for "all" contacts)
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --limit N              Max results (0 for unlimited) (default 20)
+  --since TIME           Only accept events newer than this (Unix, ISO 8601, or relative like "1 hour ago") (default "now")
+  --until TIME           Only accept events older than this (Unix, ISO 8601, or relative like "yesterday") (default "forever")
+  --json                 Output raw JSON
+  -h, --help             Show help
+EOF
+}
+
+print_help_profile_set() {
+    cat <<EOF
+${SCRIPT_NAME} profile set
+
+Usage: ${SCRIPT_NAME} profile set [options]
+
+Set profile metadata (kind 0).
+
+Options:
+  --nsec NSEC            Secret key (nsec, private hex, or alias)
+  --name NAME            Profile name
+  --about ABOUT          About/description
+  --picture URL          Picture URL
+  --nip05 NIP05          NIP-05 identifier
+  --lud16 LUD16          Lightning address
+  --display-name NAME    Display name
+  --website URL          Website URL
+  --banner URL           Banner URL
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --json                 Output JSON
+  -h, --help             Show help
+EOF
+}
+
+print_help_contact() {
+    cat <<EOF
+${SCRIPT_NAME} contact
+
+Usage: ${SCRIPT_NAME} contact <verb> [options]
+
+Verbs:
+  send                   Send one message to one or more contacts
+  get                    Fetch matching contact messages
+  listen                 Stream future contact messages
+
+Run '${SCRIPT_NAME} contact <verb> --help' for more information on a verb.
+EOF
+}
+
+print_help_contact_send() {
+    cat <<EOF
+${SCRIPT_NAME} contact send
+
+Usage: ${SCRIPT_NAME} contact send [options]
+
+Send a DM to one or more contacts. Each --npub receives a separate encrypted DM.
+
+Options:
+  --nsec NSEC            Secret key (nsec, private hex, or alias)
+  --npub NPUB            Recipient (repeatable; accepts npub, hex, alias, NIP-05)
+  --text TEXT            Text message (repeatable; use '-' to read from stdin)
+  --text-file PATH       Read text from file (repeatable)
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --json                 Output JSON
+  -h, --help             Show help
+EOF
+}
+
+print_help_contact_get() {
+    cat <<EOF
+${SCRIPT_NAME} contact get
+
+Usage: ${SCRIPT_NAME} contact get [options]
+
+Fetch decrypted DM messages (kind 14 via kind 1059).
+If --npub is omitted, fetches from ALL senders.
+If --npub is given, filters to only those senders.
+
+Options:
+  --nsec NSEC            Secret key (nsec, private hex, or alias)
+  --npub NPUB            Filter by sender (repeatable; omit for "all")
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --limit N              Max results (0 for unlimited) (default 20)
+  --since TIME           Only accept events newer than this (Unix, ISO 8601, or relative like "1 hour ago") (default "now")
+  --until TIME           Only accept events older than this (Unix, ISO 8601, or relative like "yesterday") (default "forever")
+  --json                 Output raw JSON
+  -h, --help             Show help
+EOF
+}
+
+print_help_contact_listen() {
+    cat <<EOF
+${SCRIPT_NAME} contact listen
+
+Usage: ${SCRIPT_NAME} contact listen [options]
+
+Stream past and/or future contact messages (DMs).
+Uses native real-time streaming.
+Press Ctrl+C to stop.
+
+Options:
+  --nsec NSEC            Secret key in nsec form (or private hex, or alias)
+  --npub NPUB            Filter by sender (repeatable; accepts npub, hex, alias, NIP-05)
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --limit N              Stop after fetching N messages (default "unlimited")
+  --since TIME           Backfill messages newer than this (Unix, ISO 8601, or relative) (default "now")
+  --until TIME           Stop listening after this time (Unix, ISO 8601, or relative) (default "forever")
+  --exec COMMAND         Execute COMMAND for each received message.
+                         Raw JSON event is piped to stdin.
+                         Metadata available via OXCHATCLI_* env vars.
+                         Runs in background (&) to avoid blocking.
+                         Example: --exec "jq '.content' | logger -t nostr"
+  --json                 Output JSON
+  -h, --help             Show help
+
+--exec Examples:
+  --exec "/path/to/bot.sh"                    # Run script with JSON on stdin
+  --exec "python3 /opt/reply.py"              # Run Python bot
+  --exec "curl -X POST -d @- https://webhook" # POST JSON to webhook
+  --exec "jq -r '.content' | say"             # macOS text-to-speech
+  --exec "OXCHATCLI_CONTENT=\$OXCHATCLI_CONTENT /my/script" # Use env vars
+
+Note: The executed command runs in background (&). Slow commands won't block
+      the listener, but ensure your script handles stdin correctly.
+EOF
+}
+
+print_help_private_group() {
+    cat <<EOF
+${SCRIPT_NAME} private-group
+
+Usage: ${SCRIPT_NAME} private-group <verb> [options]
+
+Description: NIP-17 encrypted private groups
+
+Verbs:
+  send                   Send a message
+  get                    Fetch matching messages
+  listen                 Stream future messages
+
+Run '${SCRIPT_NAME} private-group <verb> --help' for more information on a verb.
+EOF
+}
+
+print_help_private_group_send() {
+    cat <<EOF
+${SCRIPT_NAME} private-group send
+
+Usage: ${SCRIPT_NAME} private-group send [options]
+
+Send a message to a NIP-17 encrypted private group.
+You must understand how NIP-17 groups work. Thety are defined by
+its members. If you add/remove a member you are in fact creating a new group.
+And you cannot have 2 groups with the same members.
+
+Options:
+  --nsec NSEC            Secret key (nsec, private hex, or alias)
+  --npub NPUB            Group members (repeatable; forbidden if using private-groups config)
+  --group-name NAME      Group/room name (required)
+  --text TEXT            Text message (use '-' to read from stdin)
+  --text-file PATH       Read text message from file
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --json                 Output JSON
+  -h, --help             Show help
+
+Note: If private-groups.sh exists, --group-name selects the group from config
+      and --npub is forbidden. Members come exclusively from the config file.
+      If no config exists, --npub must be provided on the CLI to specify the
+      group members nad hence the group.
+EOF
+}
+
+print_help_private_group_get() {
+    cat <<EOF
+${SCRIPT_NAME} private-group get
+
+Usage: ${SCRIPT_NAME} private-group get [options]
+
+Fetch decrypted private-group messages (kind 14 via kind 1059 with subject tag).
+A private group is defined by its exact member list. It has a subject tag.
+You must understand how NIP-17 groups work. Thety are defined by
+its members. If you add/remove a member you are in fact creating a new group.
+And you cannot have 2 groups with the same members.
+
+Options:
+  --nsec NSEC            Secret key (nsec, private hex, or alias)
+  --npub NPUB            Group members (repeatable; forbidden if using private-groups config)
+  --group-name NAME      Filter by group subject name (required)
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --limit N              Max results (0 for unlimited) (default 20)
+  --since TIME           Only accept events newer than this (Unix, ISO 8601, or relative like "1 hour ago") (default "now")
+  --until TIME           Only accept events older than this (Unix, ISO 8601, or relative like "yesterday") (default "forever")
+  --json                 Output raw JSON
+  -h, --help             Show help
+
+Note: If private-groups.sh exists, --group-name selects the group from config
+      and --npub is forbidden. Members come exclusively from the config file.
+      If no config exists, --npub must be provided on the CLI to specify the
+      group members nad hence the group.
+EOF
+}
+
+print_help_private_group_listen() {
+    cat <<EOF
+${SCRIPT_NAME} private-group listen
+
+Usage: ${SCRIPT_NAME} private-group listen [options]
+
+Stream past and/or future private-group messages.
+Uses native real-time streaming.
+Press Ctrl+C to stop.
+
+Options:
+  --nsec NSEC            Secret key in nsec form (or private hex, or alias)
+  --npub NPUB            Group members (repeatable; forbidden if using private-groups config)
+  --group-name NAME      Group/room name (required)
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --limit N              Stop after fetching N messages (default "unlimited")
+  --since TIME           Backfill messages newer than this (Unix, ISO 8601, or relative) (default "now")
+  --until TIME           Stop listening after this time (Unix, ISO 8601, or relative) (default "forever")
+  --exec COMMAND         Execute COMMAND for each received message.
+                         Raw JSON event is piped to stdin.
+                         Metadata available via OXCHATCLI_* env vars.
+                         Runs in background (&) to avoid blocking.
+                         Example: --exec "jq '.content' | logger -t nostr"
+  --json                 Output JSON
+  -h, --help             Show help
+
+--exec Examples:
+  --exec "/path/to/bot.sh"                    # Run script with JSON on stdin
+  --exec "python3 /opt/reply.py"              # Run Python bot
+  --exec "curl -X POST -d @- https://webhook" # POST JSON to webhook
+  --exec "jq -r '.content' | say"             # macOS text-to-speech
+  --exec "OXCHATCLI_CONTENT=\$OXCHATCLI_CONTENT /my/script" # Use env vars
+
+Note: The executed command runs in background (&). Slow commands won't block
+      the listener, but ensure your script handles stdin correctly.
+EOF
+}
+
+print_help_nip29() {
+    local noun="$1"
+    local desc=""
+    case "$noun" in
+        open-group) desc="NIP-29 open group" ;;
+        closed-group) desc="NIP-29 closed group" ;;
+    esac
+    cat <<EOF
+${SCRIPT_NAME} ${noun}
+
+Usage: ${SCRIPT_NAME} ${noun} <verb> [options]
+
+Description: ${desc}
+
+Verbs:
+  send                   Send a message
+  get                    Fetch matching messages
+  listen                 Stream future messages
+
+Run '${SCRIPT_NAME} ${noun} <verb> --help' for more information on a verb.
+EOF
+}
+
+print_help_nip29_send() {
+    local noun="$1"
+    cat <<EOF
+${SCRIPT_NAME} ${noun} send
+
+Usage: ${SCRIPT_NAME} ${noun} send [options]
+
+Send a message to one or more NIP-29 ${noun}s.
+
+Options:
+  --nsec NSEC            Secret key in nsec form (or private hex, or alias) to prove you are member of the group
+  --group-id ID          Group identity (repeatable; accepts alias from config file, group-id, naddr1)
+  --text TEXT            Text message (use '-' to read from stdin)
+  --text-file PATH       Read text message from file
+  --relay URL            Group Relay URL (provide exactly one, fallback for raw IDs)
+  --json                 Output JSON
+  -h, --help             Show help
+EOF
+}
+
+print_help_nip29_get() {
+    local noun="$1"
+    cat <<EOF
+${SCRIPT_NAME} ${noun} get
+
+Usage: ${SCRIPT_NAME} ${noun} get [options]
+
+Fetch messages from a NIP-29 ${noun}.
+
+Options:
+  --nsec NSEC            Secret key in nsec form (or private hex, or alias) to prove you are member of the group
+  --group-id ID          Group identity (exactly once; accepts alias from config file, group-id, naddr1)
+  --npub NPUB            Filter by sender (repeatable; accepts npub, hex, alias, NIP-05; omit for "all")
+  --relay URL            Group Relay URL (provide exactly one, fallback for raw IDs)
+  --limit N              Max results (0 for unlimited) (default 20)
+  --since TIME           Only accept events newer than this (Unix, ISO 8601, or relative) (default "now")
+  --until TIME           Only accept events older than this (Unix, ISO 8601, or relative) (default "forever")
+  --json                 Output raw JSON
+  -h, --help             Show help
+EOF
+}
+
+print_help_nip29_listen() {
+    local noun="$1"
+    cat <<EOF
+${SCRIPT_NAME} ${noun} listen
+
+Usage: ${SCRIPT_NAME} ${noun} listen [options]
+
+Stream past and/or future messages from a NIP-29 ${noun}.
+Uses native real-time streaming.
+Press Ctrl+C to stop.
+
+Options:
+  --nsec NSEC            Secret key in nsec form (or private hex, or alias) to prove you are member of the group
+  --group-id ID          Group identity (exactly once; accepts alias from config file, group-id, naddr1)
+  --npub NPUB            Filter by sender (repeatable; accepts npub, hex, alias, NIP-05; omit for "all")
+  --relay URL            Group Relay URL (provide exactly one, fallback for raw IDs)
+  --limit N              Stop after fetching N messages (default "unlimited")
+  --since TIME           Backfill messages newer than this (Unix, ISO 8601, or relative) (default "now")
+  --until TIME           Stop listening after this time (Unix, ISO 8601, or relative) (default "forever")
+  --exec COMMAND         Execute COMMAND for each received message.
+                         Raw JSON event is piped to stdin.
+                         Metadata available via OXCHATCLI_* env vars.
+                         Runs in background (&) to avoid blocking.
+                         Example: --exec "jq '.content' | logger -t nostr"
+  --json                 Output JSON
+  -h, --help             Show help
+
+--exec Examples:
+  --exec "/path/to/bot.sh"                    # Run script with JSON on stdin
+  --exec "python3 /opt/reply.py"              # Run Python bot
+  --exec "curl -X POST -d @- https://webhook" # POST JSON to webhook
+  --exec "jq -r '.content' | say"             # macOS text-to-speech
+  --exec "OXCHATCLI_CONTENT=\$OXCHATCLI_CONTENT /my/script" # Use env vars
+
+Note: The executed command runs in background (&). Slow commands won't block
+      the listener, but ensure your script handles stdin correctly.
+EOF
+}
+
+print_help_public_channel() {
+    cat <<EOF
+${SCRIPT_NAME} public-channel
+
+Usage: ${SCRIPT_NAME} public-channel <verb> [options]
+
+Description: NIP-28 public channels
+
+Verbs:
+  send                   Send a message to one or more channels
+  get                    Fetch matching messages from a channel
+  listen                 Stream future messages from a channel
+
+Run '${SCRIPT_NAME} public-channel <verb> --help' for more information on a verb.
+EOF
+}
+
+print_help_public_channel_send() {
+    cat <<EOF
+${SCRIPT_NAME} public-channel send
+
+Usage: ${SCRIPT_NAME} public-channel send [options]
+
+Send a message to one or more NIP-28 public channels.
+
+Options:
+  --nsec NSEC            Secret key in nsec form (or private hex, or alias)
+  --channel-id ID        Public channel identity (repeatable; accepts channel-id, alias, NIP-19 nevent)
+  --text TEXT            Text message (use '-' to read from stdin)
+  --text-file PATH       Read text message from file
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --json                 Output JSON
+  -h, --help             Show help
+EOF
+}
+
+print_help_public_channel_get() {
+cat <<EOF
+${SCRIPT_NAME} public-channel get
+
+Usage: ${SCRIPT_NAME} public-channel get [options]
+
+Fetch messages from a NIP-28 public channel.
+
+Options:
+  --channel-id ID        Public channel identity (exactly once; accepts channel-id, alias, NIP-19 nevent)
+  --npub NPUB            Filter by sender (repeatable; accepts npub, hex, alias, NIP-05; omit for "all")
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --limit N              Max results (0 for unlimited) (default 20)
+  --since TIME           Only accept events newer than this (Unix, ISO 8601, or relative) (default "now")
+  --until TIME           Only accept events older than this (Unix, ISO 8601, or relative) (default "forever")
+  --json                 Output raw JSON
+  -h, --help             Show help
+EOF
+}
+
+print_help_public_channel_listen() {
+    cat <<EOF
+${SCRIPT_NAME} public-channel listen
+
+Usage: ${SCRIPT_NAME} public-channel listen [options]
+
+Stream past and/or future messages from a NIP-28 public channel.
+Uses native real-time streaming.
+Press Ctrl+C to stop.
+
+Options:
+  --channel-id ID        Public channel identity (exactly once; accepts channel-id, alias, NIP-19 nevent)
+  --npub NPUB            Filter by sender (repeatable; accepts npub, hex, alias, NIP-05; omit for "all")
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --limit N              Stop after fetching N messages (default "unlimited")
+  --since TIME           Backfill messages newer than this (Unix, ISO 8601, or relative) (default "now")
+  --until TIME           Stop listening after this time (Unix, ISO 8601, or relative) (default "forever")
+  --exec COMMAND         Execute COMMAND for each received message.
+                         Raw JSON event is piped to stdin.
+                         Metadata available via OXCHATCLI_* env vars.
+                         Runs in background (&) to avoid blocking.
+                         Example: --exec "jq '.content' | logger -t nostr"
+  --json                 Output JSON
+  -h, --help             Show help
+
+--exec Examples:
+  --exec "/path/to/bot.sh"                    # Run script with JSON on stdin
+  --exec "python3 /opt/reply.py"              # Run Python bot
+  --exec "curl -X POST -d @- https://webhook" # POST JSON to webhook
+  --exec "jq -r '.content' | say"             # macOS text-to-speech
+  --exec "OXCHATCLI_CONTENT=\$OXCHATCLI_CONTENT /my/script" # Use env vars
+
+Note: The executed command runs in background (&). Slow commands won't block
+      the listener, but ensure your script handles stdin correctly.
+EOF
+}
+
+print_help_post() {
+    cat <<EOF
+${SCRIPT_NAME} post
+
+Usage: ${SCRIPT_NAME} post <verb> [options]
+
+Verbs:
+  send                   Send a signed public note
+  get                    Fetch public posts
+  listen                 Stream future public posts
+
+Run '${SCRIPT_NAME} post <verb> --help' for more information on a verb.
+EOF
+}
+
+print_help_post_send() {
+    cat <<EOF
+${SCRIPT_NAME} post send
+
+Usage: ${SCRIPT_NAME} post send [options]
+
+Send a signed public note to the network.
+
+Options:
+  --nsec NSEC            Secret key in nsec form (or private hex, or alias)
+  --text TEXT            Text message (use '-' to read from stdin)
+  --text-file PATH       Read text message from file
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --json                 Output JSON
+  -h, --help             Show help
+EOF
+}
+
+print_help_post_get() {
+    cat <<EOF
+${SCRIPT_NAME} post get
+
+Usage: ${SCRIPT_NAME} post get [options]
+
+Fetch public posts.
+
+Options:
+  --npub NPUB            Filter by author (repeatable; accepts npub, hex, alias, NIP-05; omit for "all" contacts)
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --limit N              Max results (0 for unlimited) (default 20)
+  --since TIME           Only accept events newer than this (Unix, ISO 8601, or relative like "1 hour ago") (default "now")
+  --until TIME           Only accept events older than this (Unix, ISO 8601, or relative like "yesterday") (default "forever")
+  --json                 Output raw JSON
+  -h, --help             Show help
+EOF
+}
+
+print_help_post_listen() {
+    cat <<EOF
+${SCRIPT_NAME} post listen
+
+Usage: ${SCRIPT_NAME} post listen [options]
+
+Stream past and/or future public posts.
+Uses native real-time streaming.
+Press Ctrl+C to stop.
+
+Options:
+  --npub NPUB            Filter by author (repeatable; omit for "all" contacts)
+  --relay URL            Relay URL (repeatable; provide 1 or more times)
+  --limit N              Stop after fetching N posts (default "unlimited")
+  --since TIME           Backfill posts newer than this (Unix, ISO 8601, or relative) (default "now")
+  --until TIME           Stop listening after this time (Unix, ISO 8601, or relative) (default "forever")
+  --exec COMMAND         Execute COMMAND for each received message.
+                         Raw JSON event is piped to stdin.
+                         Metadata available via OXCHATCLI_* env vars.
+                         Runs in background (&) to avoid blocking.
+                         Example: --exec "jq '.content' | logger -t nostr"
+  --json                 Output raw JSON
+  -h, --help             Show help
+
+--exec Examples:
+  --exec "/path/to/bot.sh"                    # Run script with JSON on stdin
+  --exec "python3 /opt/reply.py"              # Run Python bot
+  --exec "curl -X POST -d @- https://webhook" # POST JSON to webhook
+  --exec "jq -r '.content' | say"             # macOS text-to-speech
+  --exec "OXCHATCLI_CONTENT=\$OXCHATCLI_CONTENT /my/script" # Use env vars
+
+Note: The executed command runs in background (&). Slow commands won't block
+      the listener, but ensure your script handles stdin correctly.
+EOF
+}
+
+print_help_self_test() {
+    cat <<EOF
+${SCRIPT_NAME} self-test
+
+Usage: ${SCRIPT_NAME} self-test [options]
+
+Run a bounded set of automated checks for implemented functionality.
+
+Options:
+  -h, --help             Show help
+EOF
+}
+
+# ==============================================================================
+# Argument Parsers (Full Versions with --exec support)
+# ==============================================================================
+
+parse_global_args() {
+    log_debug "Entering parse_global_args with $# arguments"
+    while (($#)); do
+        case "$1" in
+            -h|--help) SHOW_HELP=1 ;;
+            -v|--version) SHOW_VERSION=1 ;;
+            -d|--debug)
+                if [[ $QUIET -eq 1 ]]; then usage_error "Cannot use --debug and --quiet together"; fi
+                DEBUG=1
+                ;;
+            -q|--quiet)
+                if [[ $DEBUG -eq 1 ]]; then usage_error "Cannot use --debug and --quiet together"; fi
+                QUIET=1
+                ;;
+            --no-color) NO_COLOR=1 ;;
+            --json) JSON=1 ;;
+            --config-identities) [[ $# -ge 2 ]] || usage_error "Missing value for --config-identities"; CONFIG_IDENTITIES_PATH="$(trim "$2")"; shift ;;
+            --config-contacts) [[ $# -ge 2 ]] || usage_error "Missing value for --config-contacts"; CONFIG_CONTACTS_PATH="$(trim "$2")"; shift ;;
+            --config-relays) [[ $# -ge 2 ]] || usage_error "Missing value for --config-relays"; CONFIG_RELAYS_PATH="$(trim "$2")"; shift ;;
+            --config-private-groups) [[ $# -ge 2 ]] || usage_error "Missing value for --config-private-groups"; CONFIG_PRIVATE_GROUPS_PATH="$(trim "$2")"; shift ;;
+            --config-channels) [[ $# -ge 2 ]] || usage_error "Missing value for --config-channels"; CONFIG_CHANNELS_PATH="$(trim "$2")"; shift ;;
+            --config-open-closed-groups) [[ $# -ge 2 ]] || usage_error "Missing value for --config-open-closed-groups"; CONFIG_OPEN_CLOSED_GROUPS_PATH="$(trim "$2")"; shift ;;
+            help|version|key|profile|contact|private-group|open-group|closed-group|public-channel|post|event|timestamp|self-test)
+                TOP_COMMAND="$1"
+                shift
+                COMMAND_REST=("$@")
+                log_debug "Found TOP_COMMAND: $TOP_COMMAND"
+                return 0
+                ;;
+            --) shift; break ;;
+            *) usage_error "Unknown global option: $1" ;;
+        esac
+        shift
+    done
+    COMMAND_REST=("$@")
+    log_debug "Exiting parse_global_args"
+}
+
+parse_event_args() {
+    log_debug "Entering parse_event_args"
+    while (($#)); do
+        case "$1" in
+            -h|--help|help) SHOW_HELP=1; HELP_LEVEL="command"; return 0 ;;
+            --nevent)
+                [[ $# -ge 2 ]] || usage_error "Missing value for --nevent"
+                NEVENTS+=("$2"); shift ;;
+            *)
+                if [[ "$1" == nostr:nevent1* || "$1" == nevent1* ]] || \
+		[[ "$1" == nostr:naddr1* || "$1" == naddr1* ]]; then
+                    NEVENTS+=("$1")
+                else
+                    usage_error "Unknown event option or invalid nevent: $1"
+                fi
+                ;;
+        esac
+        shift
+    done
+    log_debug "Exiting parse_event_args"
+}
+
+parse_timestamp_args() {
+    log_debug "Entering parse_timestamp_args"
+    while (($#)); do
+        case "$1" in
+            -h|--help|help) SHOW_HELP=1; HELP_LEVEL="command"; return 0 ;;
+            --timestamp|-t) [[ $# -ge 2 ]] || usage_error "Missing value for --timestamp"; TIMESTAMP_VALUE="$2"; shift ;;
+            *)
+                if [[ -z "$TIMESTAMP_VALUE" ]]; then
+                    TIMESTAMP_VALUE="$1"
+                else
+                    usage_error "Unknown timestamp option or multiple values provided: $1"
+                fi
+                ;;
+        esac
+        shift
+    done
+    log_debug "Exiting parse_timestamp_args"
+}
+
+parse_key_args() {
+    log_debug "Entering parse_key_args"
+    case "${1:-}" in
+        -h|--help|help|"") SHOW_HELP=1; HELP_LEVEL="command"; return 0 ;;
+    esac
+    VERB="$1"
+    shift || true
+    case "$VERB" in
+        generate) HELP_FUNC="print_help_key_generate" ;;
+        convert-nsec-to-hex) HELP_FUNC="print_help_key_convert_nsec_to_hex" ;;
+        convert-npub-to-hex) HELP_FUNC="print_help_key_convert_npub_to_hex" ;;
+        convert-hex-to-nsec) HELP_FUNC="print_help_key_convert_hex_to_nsec" ;;
+        convert-hex-to-npub) HELP_FUNC="print_help_key_convert_hex_to_npub" ;;
+        derive-npub) HELP_FUNC="print_help_key_derive_npub" ;;
+        derive-public-hex) HELP_FUNC="print_help_key_derive_public_hex" ;;
+        *) usage_error "Unknown key command: $VERB" ;;
+    esac
+    while (($#)); do
+        case "$1" in
+            -h|--help|help) SHOW_HELP=1; HELP_LEVEL="verb"; return 0 ;;
+            --nsec)
+                if [[ $CLI_HAS_NSEC -eq 1 ]]; then usage_error "--nsec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_NSEC=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --nsec"; resolve_and_set_nsec "$2"; shift ;;
+            --npub) [[ $# -ge 2 ]] || usage_error "Missing value for --npub"; resolve_and_append_npub "$2"; shift ;;
+            --hex)
+                if [[ $CLI_HAS_HEX -eq 1 ]]; then usage_error "--hex can only be specified exactly once on the CLI"; fi
+                CLI_HAS_HEX=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --hex"; HEX_VALUE="$(trim "$2")"; shift ;;
+            --json) JSON=1 ;;
+            *) usage_error "Unknown key option: $1" ;;
+        esac
+        shift
+    done
+    log_debug "Exiting parse_key_args"
+}
+
+parse_profile_args() {
+    log_debug "Entering parse_profile_args"
+    case "${1:-}" in
+        -h|--help|help|"") SHOW_HELP=1; HELP_LEVEL="command"; return 0 ;;
+    esac
+    VERB="$1"
+    shift || true
+    case "$VERB" in
+        get) HELP_FUNC="print_help_profile_get" ;;
+        set) HELP_FUNC="print_help_profile_set" ;;
+        *) usage_error "Unknown profile command: $VERB" ;;
+    esac
+    while (($#)); do
+        case "$1" in
+            -h|--help|help) SHOW_HELP=1; HELP_LEVEL="verb"; return 0 ;;
+            --nsec)
+                if [[ $CLI_HAS_NSEC -eq 1 ]]; then usage_error "--nsec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_NSEC=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --nsec"; resolve_and_set_nsec "$2"; shift ;;
+            --npub)
+                if [[ $CLI_HAS_NPUBS -eq 0 ]]; then NPUBS=(); CLI_HAS_NPUBS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --npub"
+                resolve_and_append_npub "$2"
+                shift ;;
+            --relay)
+                if [[ $CLI_HAS_RELAYS -eq 0 ]]; then RELAYS=(); CLI_HAS_RELAYS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --relay"; RELAYS+=("$(trim "$2")"); shift ;;
+            --limit)
+                if [[ $CLI_HAS_LIMIT -eq 1 ]]; then usage_error "--limit can only be specified exactly once on the CLI"; fi
+                CLI_HAS_LIMIT=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --limit"; LIMIT="$2"; shift ;;
+            --since)
+                if [[ $CLI_HAS_SINCE -eq 1 ]]; then usage_error "--since can only be specified exactly once on the CLI"; fi
+                CLI_HAS_SINCE=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --since"
+                if ! SINCE=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --until)
+                if [[ $CLI_HAS_UNTIL -eq 1 ]]; then usage_error "--until can only be specified exactly once on the CLI"; fi
+                CLI_HAS_UNTIL=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --until"
+                if ! UNTIL=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --name) [[ $# -ge 2 ]] || usage_error "Missing value for --name"; PROFILE_NAME="$(trim "$2")"; shift ;;
+            --about) [[ $# -ge 2 ]] || usage_error "Missing value for --about"; PROFILE_ABOUT="$(trim "$2")"; shift ;;
+            --picture) [[ $# -ge 2 ]] || usage_error "Missing value for --picture"; PROFILE_PICTURE="$(trim "$2")"; shift ;;
+            --nip05) [[ $# -ge 2 ]] || usage_error "Missing value for --nip05"; PROFILE_NIP05="$(trim "$2")"; shift ;;
+            --lud16) [[ $# -ge 2 ]] || usage_error "Missing value for --lud16"; PROFILE_LUD16="$(trim "$2")"; shift ;;
+            --display-name) [[ $# -ge 2 ]] || usage_error "Missing value for --display-name"; PROFILE_DISPLAY_NAME="$(trim "$2")"; shift ;;
+            --website) [[ $# -ge 2 ]] || usage_error "Missing value for --website"; PROFILE_WEBSITE="$(trim "$2")"; shift ;;
+            --banner) [[ $# -ge 2 ]] || usage_error "Missing value for --banner"; PROFILE_BANNER="$(trim "$2")"; shift ;;
+            --json) JSON=1 ;;
+            *) usage_error "Unknown profile option: $1" ;;
+        esac
+        shift
+    done
+    # Strict Verb-Option Validation
+    if [[ "$VERB" == "get" ]]; then
+        if [[ $CLI_HAS_NSEC -eq 1 || -n "$PROFILE_NAME" || -n "$PROFILE_ABOUT" || -n "$PROFILE_PICTURE" || -n "$PROFILE_NIP05" || -n "$PROFILE_LUD16" || -n "$PROFILE_DISPLAY_NAME" || -n "$PROFILE_WEBSITE" || -n "$PROFILE_BANNER" ]]; then
+            usage_error "Metadata options (--nsec, --name, --about, etc.) are only valid for 'profile set'."
+        fi
+    elif [[ "$VERB" == "set" ]]; then
+        if [[ $CLI_HAS_LIMIT -eq 1 || $CLI_HAS_SINCE -eq 1 || $CLI_HAS_UNTIL -eq 1 || $CLI_HAS_NPUBS -eq 1 ]]; then
+            usage_error "Query options (--limit, --since, --until, --npub) are only valid for 'profile get'."
+        fi
+    fi
+    log_debug "Exiting parse_profile_args"
+}
+
+parse_contact_args() {
+    log_debug "Entering parse_contact_args"
+    case "${1:-}" in
+        -h|--help|help|"") SHOW_HELP=1; HELP_LEVEL="command"; return 0 ;;
+    esac
+    VERB="$1"
+    shift || true
+    case "$VERB" in
+        send) HELP_FUNC="print_help_contact_send" ;;
+        get) HELP_FUNC="print_help_contact_get" ;;
+        listen) HELP_FUNC="print_help_contact_listen" ;;
+        *) usage_error "Unknown contact command: $VERB" ;;
+    esac
+    while (($#)); do
+        case "$1" in
+            -h|--help|help) SHOW_HELP=1; HELP_LEVEL="verb"; return 0 ;;
+            --nsec)
+                if [[ $CLI_HAS_NSEC -eq 1 ]]; then usage_error "--nsec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_NSEC=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --nsec"; resolve_and_set_nsec "$2"; shift ;;
+            --npub)
+                if [[ $CLI_HAS_NPUBS -eq 0 ]]; then NPUBS=(); CLI_HAS_NPUBS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --npub"
+                resolve_and_append_npub "$2"
+                shift ;;
+            --text) [[ $# -ge 2 ]] || usage_error "Missing value for --text"; TEXTS+=("$2"); shift ;;
+            --text-file) [[ $# -ge 2 ]] || usage_error "Missing value for --text-file"; TEXT_FILES+=("$(trim "$2")"); shift ;;
+            --relay)
+                if [[ $CLI_HAS_RELAYS -eq 0 ]]; then RELAYS=(); CLI_HAS_RELAYS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --relay"; RELAYS+=("$(trim "$2")"); shift ;;
+            --limit)
+                if [[ $CLI_HAS_LIMIT -eq 1 ]]; then usage_error "--limit can only be specified exactly once on the CLI"; fi
+                CLI_HAS_LIMIT=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --limit"; LIMIT="$2"; shift ;;
+            --since)
+                if [[ $CLI_HAS_SINCE -eq 1 ]]; then usage_error "--since can only be specified exactly once on the CLI"; fi
+                CLI_HAS_SINCE=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --since"
+                if ! SINCE=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --until)
+                if [[ $CLI_HAS_UNTIL -eq 1 ]]; then usage_error "--until can only be specified exactly once on the CLI"; fi
+                CLI_HAS_UNTIL=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --until"
+                if ! UNTIL=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --exec)
+                if [[ $CLI_HAS_EXEC_CMD -eq 1 ]]; then usage_error "--exec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_EXEC_CMD=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --exec"; EXEC_CMD="$(trim "$2")"; shift ;;
+            --json) JSON=1 ;;
+            *) usage_error "Unknown contact option: $1" ;;
+        esac
+        shift
+    done
+    # Strict Verb-Option Validation
+    if [[ "$VERB" == "send" ]]; then
+        if [[ $CLI_HAS_LIMIT -eq 1 || $CLI_HAS_SINCE -eq 1 || $CLI_HAS_UNTIL -eq 1 ]]; then
+            usage_error "Query options (--limit, --since, --until) are only valid for vers 'get' and 'listen'."
+        fi
+    elif [[ "$VERB" == "get" || "$VERB" == "listen" ]]; then
+        if [[ ${#TEXTS[@]} -gt 0 || ${#TEXT_FILES[@]} -gt 0 ]]; then
+            usage_error "Message options (--text, --text-file) are only valid for verb 'send'."
+        fi
+    fi
+    log_debug "Exiting parse_contact_args"
+}
+
+# v0.31.0: Updated to enforce private-groups config mutual exclusivity
+parse_group_args() {
+    local noun="$1"
+    shift || true
+    log_debug "Entering parse_group_args for $noun"
+    case "${1:-}" in
+        -h|--help|help|"") SHOW_HELP=1; HELP_LEVEL="command"; return 0 ;;
+    esac
+    VERB="$1"
+    shift || true
+    case "$VERB" in
+        send) HELP_FUNC="print_help_private_group_send" ;;
+        get) HELP_FUNC="print_help_private_group_get" ;;
+        listen) HELP_FUNC="print_help_private_group_listen" ;;
+        *) usage_error "Unknown ${noun} command: $VERB" ;;
+    esac
+    while (($#)); do
+        case "$1" in
+            -h|--help|help) SHOW_HELP=1; HELP_LEVEL="verb"; return 0 ;;
+            --nsec)
+                if [[ $CLI_HAS_NSEC -eq 1 ]]; then usage_error "--nsec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_NSEC=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --nsec"; resolve_and_set_nsec "$2"; shift ;;
+            --npub)
+                if [[ $CLI_HAS_NPUBS -eq 0 ]]; then NPUBS=(); CLI_HAS_NPUBS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --npub"
+                resolve_and_append_npub "$2"
+                shift ;;
+            --group-name)
+                if [[ $CLI_HAS_PRIVATE_GROUP_NAME -eq 1 ]]; then usage_error "--group-name can only be specified exactly once on the CLI"; fi
+                CLI_HAS_PRIVATE_GROUP_NAME=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --group-name"; PRIVATE_GROUP_NAME="$(trim "$2")"; shift ;;
+            --text) [[ $# -ge 2 ]] || usage_error "Missing value for --text"; TEXTS+=("$2"); shift ;;
+            --text-file) [[ $# -ge 2 ]] || usage_error "Missing value for --text-file"; TEXT_FILES+=("$2"); shift ;;
+            --relay)
+                if [[ $CLI_HAS_RELAYS -eq 0 ]]; then RELAYS=(); CLI_HAS_RELAYS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --relay"; RELAYS+=("$(trim "$2")"); shift ;;
+            --limit)
+                if [[ $CLI_HAS_LIMIT -eq 1 ]]; then usage_error "--limit can only be specified exactly once on the CLI"; fi
+                CLI_HAS_LIMIT=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --limit"; LIMIT="$2"; shift ;;
+            --since)
+                if [[ $CLI_HAS_SINCE -eq 1 ]]; then usage_error "--since can only be specified exactly once on the CLI"; fi
+                CLI_HAS_SINCE=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --since"
+                if ! SINCE=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --until)
+                if [[ $CLI_HAS_UNTIL -eq 1 ]]; then usage_error "--until can only be specified exactly once on the CLI"; fi
+                CLI_HAS_UNTIL=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --until"
+                if ! UNTIL=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --exec)
+                if [[ $CLI_HAS_EXEC_CMD -eq 1 ]]; then usage_error "--exec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_EXEC_CMD=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --exec"; EXEC_CMD="$(trim "$2")"; shift ;;
+            --json) JSON=1 ;;
+            *) usage_error "Unknown ${noun} option: $1" ;;
+        esac
+        shift
+    done
+    # Strict Verb-Option Validation
+    if [[ "$VERB" == "send" ]]; then
+        if [[ $CLI_HAS_LIMIT -eq 1 || $CLI_HAS_SINCE -eq 1 || $CLI_HAS_UNTIL -eq 1 ]]; then
+            usage_error "Query options (--limit, --since, --until) are only valid for verbs 'get' and 'listen'."
+        fi
+    elif [[ "$VERB" == "get" || "$VERB" == "listen" ]]; then
+        if [[ ${#TEXTS[@]} -gt 0 || ${#TEXT_FILES[@]} -gt 0 ]]; then
+            usage_error "Message options (--text, --text-file) are only valid for verb 'send'."
+        fi
+    fi
+    log_debug "Exiting parse_group_args"
+}
+
+parse_nip29_args() {
+    local noun="$1"
+    shift || true
+    log_debug "Entering parse_nip29_args for $noun"
+    case "${1:-}" in
+        -h|--help|help|"") SHOW_HELP=1; HELP_LEVEL="command"; return 0 ;;
+    esac
+    VERB="$1"
+    shift || true
+    case "$VERB" in
+        send) HELP_FUNC="print_help_nip29_send" ;;
+        get) HELP_FUNC="print_help_nip29_get" ;;
+        listen) HELP_FUNC="print_help_nip29_listen" ;;
+        *) usage_error "Unknown ${noun} command: $VERB" ;;
+    esac
+    while (($#)); do
+        case "$1" in
+            -h|--help|help) SHOW_HELP=1; HELP_LEVEL="verb"; return 0 ;;
+            --nsec)
+                if [[ $CLI_HAS_NSEC -eq 1 ]]; then usage_error "--nsec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_NSEC=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --nsec"; resolve_and_set_nsec "$2"; shift ;;
+            --group-id)
+                if [[ $CLI_HAS_NIP29_GROUPS -eq 0 ]]; then NIP29_GROUP_IDS=(); CLI_HAS_NIP29_GROUPS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --group-id"
+                local resolved
+                if resolved=$(resolve_nip29_group "$2" "${noun%-group}"); then # arg 2 is group type "open" or "closed"
+                    NIP29_GROUP_IDS+=("$resolved")
+                    log_debug "Resolved nip29 details NIP29_GROUP_IDS to: ( ${NIP29_GROUP_IDS[@]} )"
+                else
+                    exit "$EXIT_USAGE"
+                fi
+                shift ;;
+            --npub)
+                if [[ $CLI_HAS_NPUBS -eq 0 ]]; then NPUBS=(); CLI_HAS_NPUBS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --npub"
+                resolve_and_append_npub "$2"
+                shift ;;
+            --relay) NIP29_RELAY="$(trim "$2")"; shift ;;
+            --text) [[ $# -ge 2 ]] || usage_error "Missing value for --text"; TEXTS+=("$2"); shift ;;
+            --text-file) [[ $# -ge 2 ]] || usage_error "Missing value for --text-file"; TEXT_FILES+=("$(trim "$2")"); shift ;;
+            --limit)
+                if [[ $CLI_HAS_LIMIT -eq 1 ]]; then usage_error "--limit can only be specified exactly once on the CLI"; fi
+                CLI_HAS_LIMIT=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --limit"; LIMIT="$2"; shift ;;
+            --since)
+                if [[ $CLI_HAS_SINCE -eq 1 ]]; then usage_error "--since can only be specified exactly once on the CLI"; fi
+                CLI_HAS_SINCE=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --since"
+                if ! SINCE=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --until)
+                if [[ $CLI_HAS_UNTIL -eq 1 ]]; then usage_error "--until can only be specified exactly once on the CLI"; fi
+                CLI_HAS_UNTIL=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --until"
+                if ! UNTIL=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --exec)
+                if [[ $CLI_HAS_EXEC_CMD -eq 1 ]]; then usage_error "--exec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_EXEC_CMD=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --exec"; EXEC_CMD="$(trim "$2")"; shift ;;
+            --json) JSON=1 ;;
+            *) usage_error "Unknown ${noun} option: $1" ;;
+        esac
+        shift
+    done
+    # Strict Verb-Option Validation
+    if [[ "$VERB" == "send" ]]; then
+        if [[ $CLI_HAS_LIMIT -eq 1 || $CLI_HAS_SINCE -eq 1 || $CLI_HAS_UNTIL -eq 1 ]]; then
+            usage_error "Query options (--limit, --since, --until) are only valid for vers 'get' and 'listen'."
+        fi
+    elif [[ "$VERB" == "get" || "$VERB" == "listen" ]]; then
+        if [[ ${#TEXTS[@]} -gt 0 || ${#TEXT_FILES[@]} -gt 0 ]]; then
+            usage_error "Message options (--text, --text-file) are only valid for verb 'send'."
+        fi
+    fi
+    log_debug "Exiting parse_nip29_args"
+}
+
+parse_public_channel_args() {
+    log_debug "Entering parse_public_channel_args"
+    case "${1:-}" in
+        -h|--help|help|"") SHOW_HELP=1; HELP_LEVEL="command"; return 0 ;;
+    esac
+    VERB="$1"
+    shift || true
+    case "$VERB" in
+        send) HELP_FUNC="print_help_public_channel_send" ;;
+        get) HELP_FUNC="print_help_public_channel_get" ;;
+        listen) HELP_FUNC="print_help_public_channel_listen" ;;
+        *) usage_error "Unknown public-channel command: $VERB" ;;
+    esac
+    while (($#)); do
+        case "$1" in
+            -h|--help|help) SHOW_HELP=1; HELP_LEVEL="verb"; return 0 ;;
+            --nsec)
+                if [[ $CLI_HAS_NSEC -eq 1 ]]; then usage_error "--nsec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_NSEC=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --nsec"; resolve_and_set_nsec "$2"; shift ;;
+            --channel-id)
+                if [[ $CLI_HAS_CHANNEL_IDS -eq 0 ]]; then CHANNEL_IDS=(); CLI_HAS_CHANNEL_IDS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --channel-id"
+                local resolved
+                if resolved=$(resolve_channel_token "$2"); then
+                    CHANNEL_IDS+=("$resolved")
+                else
+                    exit "$EXIT_USAGE"
+                fi
+                shift ;;
+            --npub)
+                if [[ $CLI_HAS_NPUBS -eq 0 ]]; then NPUBS=(); CLI_HAS_NPUBS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --npub"
+                resolve_and_append_npub "$2"
+                shift ;;
+            --relay)
+                if [[ $CLI_HAS_RELAYS -eq 0 ]]; then RELAYS=(); CLI_HAS_RELAYS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --relay"; RELAYS+=("$(trim "$2")"); shift ;;
+            --text) [[ $# -ge 2 ]] || usage_error "Missing value for --text"; TEXTS+=("$2"); shift ;;
+            --text-file) [[ $# -ge 2 ]] || usage_error "Missing value for --text-file"; TEXT_FILES+=("$(trim "$2")"); shift ;;
+            --limit)
+                if [[ $CLI_HAS_LIMIT -eq 1 ]]; then usage_error "--limit can only be specified exactly once on the CLI"; fi
+                CLI_HAS_LIMIT=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --limit"; LIMIT="$2"; shift ;;
+            --since)
+                if [[ $CLI_HAS_SINCE -eq 1 ]]; then usage_error "--since can only be specified exactly once on the CLI"; fi
+                CLI_HAS_SINCE=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --since"
+                if ! SINCE=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --until)
+                if [[ $CLI_HAS_UNTIL -eq 1 ]]; then usage_error "--until can only be specified exactly once on the CLI"; fi
+                CLI_HAS_UNTIL=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --until"
+                if ! UNTIL=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --exec)
+                if [[ $CLI_HAS_EXEC_CMD -eq 1 ]]; then usage_error "--exec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_EXEC_CMD=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --exec"; EXEC_CMD="$(trim "$2")"; shift ;;
+            --json) JSON=1 ;;
+            *) usage_error "Unknown public-channel option: $1" ;;
+        esac
+        shift
+    done
+    # Strict Verb-Option Validation
+    if [[ "$VERB" == "send" ]]; then
+        if [[ $CLI_HAS_LIMIT -eq 1 || $CLI_HAS_SINCE -eq 1 || $CLI_HAS_UNTIL -eq 1 ]]; then
+            usage_error "Query options (--limit, --since, --until) are only valid for vers 'get' and 'listen'."
+        fi
+    elif [[ "$VERB" == "get" || "$VERB" == "listen" ]]; then
+        if [[ ${#TEXTS[@]} -gt 0 || ${#TEXT_FILES[@]} -gt 0 ]]; then
+            usage_error "Message options (--text, --text-file) are only valid for verb 'send'."
+        fi
+    fi
+    log_debug "Exiting parse_public_channel_args"
+}
+
+parse_post_args() {
+    log_debug "Entering parse_post_args"
+    case "${1:-}" in
+        -h|--help|help|"") SHOW_HELP=1; HELP_LEVEL="command"; return 0 ;;
+    esac
+    VERB="$1"
+    shift || true
+    case "$VERB" in
+        send) HELP_FUNC="print_help_post_send" ;;
+        get) HELP_FUNC="print_help_post_get" ;;
+        listen) HELP_FUNC="print_help_post_listen" ;;
+        *) usage_error "Unknown post command: $VERB" ;;
+    esac
+    while (($#)); do
+        case "$1" in
+            -h|--help|help) SHOW_HELP=1; HELP_LEVEL="verb"; return 0 ;;
+            --nsec)
+                if [[ $CLI_HAS_NSEC -eq 1 ]]; then usage_error "--nsec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_NSEC=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --nsec"; resolve_and_set_nsec "$2"; shift ;;
+            --npub)
+                if [[ $CLI_HAS_NPUBS -eq 0 ]]; then NPUBS=(); CLI_HAS_NPUBS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --npub"
+                resolve_and_append_npub "$2"
+                shift ;;
+            --relay)
+                if [[ $CLI_HAS_RELAYS -eq 0 ]]; then RELAYS=(); CLI_HAS_RELAYS=1; fi
+                [[ $# -ge 2 ]] || usage_error "Missing value for --relay"; RELAYS+=("$(trim "$2")"); shift ;;
+            --text) [[ $# -ge 2 ]] || usage_error "Missing value for --text"; TEXTS+=("$2"); shift ;;
+            --text-file) [[ $# -ge 2 ]] || usage_error "Missing value for --text-file"; TEXT_FILES+=("$2"); shift ;;
+            --limit)
+                if [[ $CLI_HAS_LIMIT -eq 1 ]]; then usage_error "--limit can only be specified exactly once on the CLI"; fi
+                CLI_HAS_LIMIT=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --limit"; LIMIT="$2"; shift ;;
+            --since)
+                if [[ $CLI_HAS_SINCE -eq 1 ]]; then usage_error "--since can only be specified exactly once on the CLI"; fi
+                CLI_HAS_SINCE=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --since"
+                if ! SINCE=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --until)
+                if [[ $CLI_HAS_UNTIL -eq 1 ]]; then usage_error "--until can only be specified exactly once on the CLI"; fi
+                CLI_HAS_UNTIL=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --until"
+                if ! UNTIL=$(resolve_timestamp_to_unix "$2"); then exit "$EXIT_USAGE"; fi
+                shift ;;
+            --exec)
+                if [[ $CLI_HAS_EXEC_CMD -eq 1 ]]; then usage_error "--exec can only be specified exactly once on the CLI"; fi
+                CLI_HAS_EXEC_CMD=1
+                [[ $# -ge 2 ]] || usage_error "Missing value for --exec"; EXEC_CMD="$(trim "$2")"; shift ;;
+            --json) JSON=1 ;;
+            *) usage_error "Unknown post option: $1" ;;
+        esac
+        shift
+    done
+    # Strict Verb-Option Validation
+    if [[ "$VERB" == "send" ]]; then
+        if [[ $CLI_HAS_LIMIT -eq 1 || $CLI_HAS_SINCE -eq 1 || $CLI_HAS_UNTIL -eq 1 ]]; then
+            usage_error "Query options (--limit, --since, --until) are only valid for vers 'get' and 'listen'."
+        fi
+    elif [[ "$VERB" == "get" || "$VERB" == "listen" ]]; then
+        if [[ ${#TEXTS[@]} -gt 0 || ${#TEXT_FILES[@]} -gt 0 ]]; then
+            usage_error "Message options (--text, --text-file) are only valid for verb 'send'."
+        fi
+    fi
+    log_debug "Exiting parse_post_args"
+}
+
+# ==============================================================================
+# Implementations: Event
+# ==============================================================================
+
+_event_decode() {
+# returns JSON object like this:
+# {
+#  "pubkey": "f1756..."
+#  "kind": 39000,
+#  "identifier": "c02d0...",
+#  "relays": [
+#    "wss://groups.0xchat.com"
+#  ]
+#}
+        local decoded
+        if decoded=$(run_nak_full nak decode "$1"); then
+		printf '%s' "$decoded"
+	else
+		return 1
+	fi
+}
+
+cmd_event() {
+    if [[ ${#NEVENTS[@]} -eq 0 ]]; then
+        usage_error "Missing --nevent argument"
+    fi
+    local first=1
+    if [[ $JSON -eq 1 ]]; then printf '['; fi
+    for nevent in "${NEVENTS[@]}"; do
+        local decoded
+        if decoded=$(_event_decode "$nevent"); then
+            if [[ $JSON -eq 1 ]]; then
+                [[ $first -eq 0 ]] && printf ','
+                printf '%s' "$decoded"
+                first=0
+            else
+                printf '%s\n' "$decoded"
+            fi
+        else
+            log_err "Failed to decode: $nevent"
+        fi
+    done
+    if [[ $JSON -eq 1 ]]; then printf ']\n'; fi
+    exit "$EXIT_OK"
+}
+
+# ==============================================================================
+# Implementations: Timestamp
+# ==============================================================================
+
+cmd_timestamp() {
+    local input="$TIMESTAMP_VALUE"
+    if [[ -z "$input" ]]; then
+        usage_error "Missing timestamp value. Provide it as an argument (e.g., '1 hour ago' or 1779887279)."
+    fi
+    if [[ "$input" =~ ^[0-9]+$ ]]; then
+        local len=${#input}
+        local unix_ts="$input"
+        if [[ $len -eq 13 ]]; then
+            unix_ts="${input:0:10}"
+        fi
+        local human
+        human=$(resolve_timestamp_to_human "$unix_ts")
+        if [[ $JSON -eq 1 ]]; then
+            printf '{"unix":%s,"human":"%s","input_type":"unix"}\n' "$unix_ts" "$human"
+        else
+            printf '%s (Unix: %s)\n' "$human" "$unix_ts"
+        fi
+    else
+        local unix_ts
+        if ! unix_ts=$(resolve_timestamp_to_unix "$input"); then
+            exit "$EXIT_ERROR"
+        fi
+        local human
+        human=$(resolve_timestamp_to_human "$unix_ts")
+        if [[ $JSON -eq 1 ]]; then
+            printf '{"unix":%s,"human":"%s","input_type":"human"}\n' "$unix_ts" "$human"
+        else
+            printf '%s (%s)\n' "$unix_ts" "$human"
+        fi
+    fi
+    exit "$EXIT_OK"
+}
+
+# ==============================================================================
+# Implementations: Key
+# ==============================================================================
+
+cmd_key_generate() {
+    log_debug "Executing key generate"
+    local private_hex
+    if ! private_hex=$(run_nak nak key generate); then
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Generated private hex (truncated): $(nsec_short "$private_hex")"
+    local nsec
+    if ! nsec=$(run_nak nak encode nsec "$private_hex"); then
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Encoded nsec: $(nsec_short "$nsec")"
+    local public_hex
+    if ! public_hex=$(run_nak nak key public "$private_hex"); then
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Derived public hex: $public_hex"
+    local npub
+    if ! npub=$(run_nak nak encode npub "$public_hex"); then
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Encoded npub: $npub"
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"nsec":"%s","private_hex":"%s","npub":"%s","public_hex":"%s"}\n' "$nsec" "$private_hex" "$npub" "$public_hex"
+    else
+        printf 'nsec:        %s\n' "$nsec"
+        printf 'private_hex: %s\n' "$private_hex"
+        printf 'npub:        %s\n' "$npub"
+        printf 'public_hex:  %s\n' "$public_hex"
+    fi
+    exit "$EXIT_OK"
+}
+
+cmd_key_derive_public_hex() {
+    log_debug "Executing key derive-public-hex"
+    local hex
+    if ! hex=$(run_nak nak key public "$NSEC"); then
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Public hex derived: $hex"
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"public_hex":"%s"}\n' "$hex"
+    else
+        printf '%s\n' "$hex"
+    fi
+    exit "$EXIT_OK"
+}
+
+cmd_key_convert_hex_to_nsec() {
+    log_debug "Executing key convert-hex-to-nsec"
+    local nsec
+    if ! nsec=$(run_nak nak encode nsec "$HEX_VALUE"); then
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Hex converted to nsec: $(nsec_short "$nsec")"
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"nsec":"%s"}\n' "$nsec"
+    else
+        printf '%s\n' "$nsec"
+    fi
+    exit "$EXIT_OK"
+}
+
+cmd_key_convert_nsec_to_hex() {
+    log_debug "Executing key convert-nsec-to-hex"
+    local hex
+    if ! hex=$(run_nak nak decode "$NSEC"); then
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Nsec decoded to private hex: $(nsec_short "$hex")"
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"private_hex":"%s"}\n' "$hex"
+    else
+        printf '%s\n' "$hex"
+    fi
+    exit "$EXIT_OK"
+}
+
+cmd_key_convert_hex_to_npub() {
+    log_debug "Executing key convert-hex-to-npub"
+    local npub
+    if ! npub=$(run_nak nak encode npub "$HEX_VALUE"); then
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Hex encoded to npub: $npub"
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"npub":"%s"}\n' "$npub"
+    else
+        printf '%s\n' "$npub"
+    fi
+    exit "$EXIT_OK"
+}
+
+cmd_key_convert_npub_to_hex() {
+    log_debug "Executing key convert-npub-to-hex"
+    local npub="${NPUBS[0]}"
+    local hex
+    if ! hex=$(run_nak nak decode "$npub"); then
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Npub $npub decoded to public hex: $hex"
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"public_hex":"%s"}\n' "$hex"
+    else
+        printf '%s\n' "$hex"
+    fi
+    exit "$EXIT_OK"
+}
+
+cmd_key_derive_npub() {
+    log_debug "Executing key derive-npub"
+    local public_hex
+    if ! public_hex=$(run_nak nak key public "$NSEC"); then
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Derived public hex: $public_hex"
+    local npub
+    if ! npub=$(run_nak nak encode npub "$public_hex"); then
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Encoded public hex to npub: $npub"
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"npub":"%s"}\n' "$npub"
+    else
+        printf '%s\n' "$npub"
+    fi
+    exit "$EXIT_OK"
+}
+
+# ==============================================================================
+# Implementations: Profile
+# ==============================================================================
+
+cmd_profile_set() {
+    log_debug "Executing profile set"
+    require_nsec
+    require_relays
+    log_debug "Building profile JSON"
+    local profile_json
+    profile_json=$(jq -nc \
+        --arg name "${PROFILE_NAME}" \
+        --arg about "${PROFILE_ABOUT}" \
+        --arg picture "${PROFILE_PICTURE}" \
+        --arg nip05 "${PROFILE_NIP05}" \
+        --arg lud16 "${PROFILE_LUD16}" \
+        --arg display_name "${PROFILE_DISPLAY_NAME}" \
+        --arg website "${PROFILE_WEBSITE}" \
+        --arg banner "${PROFILE_BANNER}" \
+        '{name:$name, about:$about, picture:$picture, nip05:$nip05, lud16:$lud16, display_name:$display_name, website:$website, banner:$banner} | with_entries(select(.value != ""))')
+    log_debug "Profile JSON: $profile_json"
+    local stderr_file output status=0 err_output
+    stderr_file=$(mktemp)
+    output=$(nak event --sec "$NSEC" -k 0 -c "$profile_json" "${RELAYS[@]}" 2>"$stderr_file") || status=$?
+    err_output=$(<"$stderr_file")
+    rm -f "$stderr_file"
+    if [[ $status -ne 0 ]]; then
+        log_err "nak event (kind 0) failed (exit $status)"
+        if [[ -n "$err_output" ]]; then
+            printf '%b[ERROR] nak stderr: %s%b\n' "$COLOR_RED" "$err_output" "$COLOR_RESET" >&2
+        fi
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Profile publish output: $output"
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"status":"published","kind":0}\n'
+    else
+        printf '%bProfile (kind 0) published to %d relay(s)%b\n' "$COLOR_GREEN" "${#RELAYS[@]}" "$COLOR_RESET"
+    fi
+    exit "$EXIT_OK"
+}
+
+cmd_profile_get() {
+    log_debug "Executing profile get"
+    require_relays
+    local limit="${LIMIT:-$DEFAULT_GET_LIMIT}"
+    if (( limit > MAX_GET_LIMIT )); then
+        usage_error "--limit $limit exceeds MAX_GET_LIMIT ($MAX_GET_LIMIT). Edit source code to increase."
+    fi
+    local -a nak_args=("req" "-k" "0")
+    if (( limit > 0 )); then
+        nak_args+=("--limit" "$limit")
+    fi
+    if [[ -n "$SINCE" ]]; then nak_args+=("--since" "$SINCE"); fi
+    if [[ -n "$UNTIL" ]]; then nak_args+=("--until" "$UNTIL"); fi
+    for relay in "${RELAYS[@]}"; do
+        nak_args+=("$relay")
+    done
+    if [[ ${#NPUBS[@]} -gt 0 ]]; then
+        log_debug "Filtering profile get by ${#NPUBS[@]} npub(s)"
+        for npub_val in "${NPUBS[@]}"; do
+            local hex
+            if ! hex=$(resolve_token_to_hex "$npub_val"); then
+                log_err "Failed to resolve npub to hex: $npub_val"
+                exit "$EXIT_ERROR"
+            fi
+            nak_args+=("-a" "$hex")
+            log_debug "Added author filter: $hex"
+        done
+    else
+        log_debug "No --npub filter; fetching profiles for all contacts"
+        if [[ ${#CONFIG_CONTACTS[@]} -eq 0 ]]; then
+            log_err "No contacts configured and no --npub specified. Add contacts to contacts.sh or use --npub."
+            exit "$EXIT_ERROR"
+        fi
+        local -a contact_hexes=()
+        while IFS= read -r hex_line; do
+            [[ -n "$hex_line" ]] && contact_hexes+=("$hex_line")
+        done < <(resolve_all_contacts_to_hex)
+        if [[ ${#contact_hexes[@]} -eq 0 ]]; then
+            log_err "Failed to resolve any contacts to public hex."
+            exit "$EXIT_ERROR"
+        fi
+        for hex in "${contact_hexes[@]}"; do
+            nak_args+=("-a" "$hex")
+            log_debug "Added contact author filter: $hex"
+        done
+    fi
+    local output
+    if ! output=$(run_nak_full nak "${nak_args[@]}"); then
+        exit "$EXIT_ERROR"
+    fi
+    if [[ $JSON -eq 1 ]]; then
+        printf '%s\n' "$output"
+    else
+        if [[ -z "$output" ]]; then
+            printf 'No profiles found.\n'
+        else
+            local first=1
+            printf '%s\n' "$output" | while IFS= read -r line; do
+                local pubkey content_json
+                pubkey=$(printf '%s' "$line" | jq -r '.pubkey // empty' 2>/dev/null)
+                content_json=$(printf '%s' "$line" | jq -c '.content | fromjson' 2>/dev/null)
+                [[ -z "$content_json" || "$content_json" == "null" ]] && content_json="{}"
+                local name display_name about gender area picture banner nip05 lud16
+                name=$(printf '%s' "$content_json" | jq -r '.name // empty' 2>/dev/null)
+                display_name=$(printf '%s' "$content_json" | jq -r '.display_name // empty' 2>/dev/null)
+                about=$(printf '%s' "$content_json" | jq -r '.about // empty' 2>/dev/null)
+                gender=$(printf '%s' "$content_json" | jq -r '.gender // empty' 2>/dev/null)
+                area=$(printf '%s' "$content_json" | jq -r '.area // empty' 2>/dev/null)
+                picture=$(printf '%s' "$content_json" | jq -r '.picture // empty' 2>/dev/null)
+                banner=$(printf '%s' "$content_json" | jq -r '.banner // empty' 2>/dev/null)
+                nip05=$(printf '%s' "$content_json" | jq -r '.nip05 // empty' 2>/dev/null)
+                lud16=$(printf '%s' "$content_json" | jq -r '.lud16 // empty' 2>/dev/null)
+                local effective_name="${name:-${display_name:-<unnamed>}}"
+                local npub_val=""
+                [[ -n "$pubkey" ]] && npub_val=$(run_nak nak encode npub "$pubkey" 2>/dev/null)
+                local alias_label=""
+                [[ -n "$pubkey" ]] && alias_label=$(lookup_alias_for_hex "$pubkey" 2>/dev/null) || alias_label=""
+                if [[ $first -eq 1 ]]; then
+                    first=0
+                else
+                    printf '%s\n' '----------------------------------------'
+                fi
+                printf 'ALIAS:       %s\n' "${alias_label:-<none>}"
+                printf 'NPUB:        %s\n' "${npub_val:-<unknown>}"
+                printf 'PUBLIC-HEX:  %s\n' "${pubkey:-<unknown>}"
+                printf 'name:        %s\n' "$effective_name"
+                printf 'about:       %s\n' "$about"
+                printf 'gender:      %s\n' "$gender"
+                printf 'area:        %s\n' "$area"
+                printf 'picture:     %s\n' "$picture"
+                printf 'banner:      %s\n' "$banner"
+                printf 'nip05:       %s\n' "$nip05"
+                printf 'lud16:       %s\n' "$lud16"
+            done
+        fi
+    fi
+    exit "$EXIT_OK"
+}
+
+# ==============================================================================
+# Implementations: Post
+# ==============================================================================
+
+cmd_post_send() {
+    log_debug "Executing post send"
+    require_nsec
+    require_text
+    require_relays
+    local message_text=""
+    if [[ ${#TEXTS[@]} -gt 0 ]]; then
+        message_text="${TEXTS[0]}"
+        if [[ "$message_text" == "-" ]]; then
+            message_text="$(cat)"
+        fi
+    elif [[ ${#TEXT_FILES[@]} -gt 0 ]]; then
+        if [[ ! -f "${TEXT_FILES[0]}" ]]; then
+            fail "Text file not found: ${TEXT_FILES[0]}"
+        fi
+        message_text=$(cat "${TEXT_FILES[0]}")
+    fi
+    log_debug "Post text length: ${#message_text}"
+    log_debug "Publishing to ${#RELAYS[@]} relay(s)"
+    local stderr_file
+    stderr_file=$(mktemp)
+    local output
+    local status=0
+    output=$(printf '%s' "$message_text" | nak publish --sec "$NSEC" "${RELAYS[@]}" 2>"$stderr_file") || status=$?
+    local err_output
+    err_output=$(<"$stderr_file")
+    rm -f "$stderr_file"
+    if [[ $status -ne 0 ]]; then
+        log_err "nak publish failed (exit $status)"
+        if [[ -n "$err_output" ]]; then
+            printf '%b[ERROR] nak stderr: %s%b\n' "$COLOR_RED" "$err_output" "$COLOR_RESET" >&2
+        fi
+        exit "$EXIT_ERROR"
+    fi
+    log_debug "Publish output: $output"
+    local event_id=""
+    event_id=$(printf '%s\n' "$output" | grep -oE '"id":"[^"]+"' | head -1 | cut -d'"' -f4)
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"status":"published","event_id":"%s","relays":%d}\n' "${event_id:-unknown}" "${#RELAYS[@]}"
+    else
+        if [[ -n "$event_id" ]]; then
+            printf '%bPublished event: %s%b\n' "$COLOR_GREEN" "$event_id" "$COLOR_RESET"
+        else
+            printf '%bPublished successfully to %d relay(s)%b\n' "$COLOR_GREEN" "${#RELAYS[@]}" "$COLOR_RESET"
+        fi
+    fi
+    exit "$EXIT_OK"
+}
+
+_fetch_posts() {
+    local req_since="$1"
+    local req_until="$2"
+    local req_limit="$3"
+    LAST_FETCH_COUNT=0
+    require_relays
+    local -a nak_args=("req" "-k" "1")
+    local effective_limit="${req_limit:-$DEFAULT_GET_LIMIT}"
+    if (( effective_limit > MAX_GET_LIMIT )); then
+        usage_error "--limit $effective_limit exceeds MAX_GET_LIMIT ($MAX_GET_LIMIT). Edit source code to increase."
+    fi
+    if (( effective_limit > 0 )); then
+        nak_args+=("--limit" "$effective_limit")
+    fi
+    if [[ -n "$req_since" ]]; then nak_args+=("--since" "$req_since"); fi
+    if [[ -n "$req_until" ]]; then nak_args+=("--until" "$req_until"); fi
+    for relay in "${RELAYS[@]}"; do nak_args+=("$relay"); done
+    if [[ ${#NPUBS[@]} -gt 0 ]]; then
+        for npub_val in "${NPUBS[@]}"; do
+            local hex
+            if ! hex=$(resolve_token_to_hex "$npub_val"); then
+                log_err "Failed to resolve npub to hex: $npub_val"
+                return 1
+            fi
+            nak_args+=("-a" "$hex")
+        done
+    else
+        if [[ ${#CONFIG_CONTACTS[@]} -eq 0 ]]; then
+            log_err "No contacts configured and no --npub specified."
+            return 1
+        fi
+        local -a contact_hexes=()
+        while IFS= read -r hex_line; do
+            [[ -n "$hex_line" ]] && contact_hexes+=("$hex_line")
+        done < <(resolve_all_contacts_to_hex)
+        for hex in "${contact_hexes[@]}"; do
+            nak_args+=("-a" "$hex")
+        done
+    fi
+    local output
+    if ! output=$(run_nak_full nak "${nak_args[@]}"); then
+        return 1
+    fi
+    if [[ -z "$output" ]]; then
+        if [[ $JSON -eq 1 ]]; then printf '[]\n'; else printf 'No posts found.\n'; fi
+        return 0
+    fi
+    # Sort events chronologically (oldest to newest)
+    output=$(printf '%s\n' "$output" | jq -sc 'sort_by(.created_at) | .[]' 2>/dev/null)
+    log_debug "_fetch_posts: sorted output is $output"
+    LAST_FETCH_COUNT=$(printf '%s\n' "$output" | awk 'NF {c++} END {print c+0}')
+    log_debug "_fetch_posts: LAST_FETCH_COUNT is $LAST_FETCH_COUNT"
+    printf '%s\n' "$output" | while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        # Execute hook if provided (always gets raw JSON)
+        if [[ -n "$EXEC_CMD" ]]; then
+            _execute_hook "$line"
+        fi
+        if [[ $JSON -eq 1 ]]; then
+            printf '%s\n' "$line"
+        else
+            local ts pubkey content date_str alias_label
+            ts=$(printf '%s' "$line" | jq -r '.created_at // empty' 2>/dev/null)
+            pubkey=$(printf '%s' "$line" | jq -r '.pubkey // empty' 2>/dev/null)
+            content=$(printf '%s' "$line" | jq -r '.content // empty' 2>/dev/null)
+            date_str=""
+            if [[ -n "$ts" ]]; then
+                date_str=$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$ts")
+            fi
+            alias_label=$(format_sender_label "$pubkey")
+            printf '[%s] [%s]: %s\n' "$date_str" "$alias_label" "$content"
+        fi
+    done
+    return 0
+}
+
+_stream_posts() {
+    local req_since="$1"
+    local req_until="$2"
+    local req_limit="$3"
+    require_relays
+    # don't set --limit and --until because they are defined differently for --listen in 0xchat-cli than in nak
+    local -a nak_args=("req" "-k" "1" "--stream")
+    if [[ -n "$req_since" ]]; then nak_args+=("--since" "$req_since"); fi
+    for relay in "${RELAYS[@]}"; do nak_args+=("$relay"); done
+    if [[ ${#NPUBS[@]} -gt 0 ]]; then
+        for npub_val in "${NPUBS[@]}"; do
+            local hex
+            if ! hex=$(resolve_token_to_hex "$npub_val"); then
+                log_error "Failed to resolve npub to hex: $npub_val"
+                return 1
+            fi
+            nak_args+=("-a" "$hex")
+        done
+    else
+        if [[ ${#CONFIG_CONTACTS[@]} -eq 0 ]]; then
+            log_err "No contacts configured and no --npub specified."
+            return 1
+        fi
+        local -a contact_hexes=()
+        while IFS= read -r hex_line; do
+            [[ -n "$hex_line" ]] && contact_hexes+=("$hex_line")
+        done < <(resolve_all_contacts_to_hex)
+        for hex in "${contact_hexes[@]}"; do nak_args+=("-a" "$hex"); done
+    fi
+    log_debug "Streaming kind 1 events: nak ${nak_args[*]}"
+    local req_stderr; req_stderr=$(mktemp)
+
+    local count=0
+    while true; do
+        if IFS= read -t 1 -r line; then
+            if [[ -n "$EXEC_CMD" ]]; then _execute_hook "$line"; fi
+            if [[ $JSON -eq 1 ]]; then
+                printf '%s\n' "$line"
+            else
+                local ts pubkey content date_str alias_label
+                ts=$(printf '%s' "$line" | jq -r '.created_at // empty' 2>/dev/null)
+                pubkey=$(printf '%s' "$line" | jq -r '.pubkey // empty' 2>/dev/null)
+                content=$(printf '%s' "$line" | jq -r '.content // empty' 2>/dev/null)
+                date_str=""
+                if [[ -n "$ts" ]]; then date_str=$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$ts"); fi
+                alias_label=$(format_sender_label "$pubkey")
+                printf '[%s] [%s]: %s\n' "$date_str" "$alias_label" "$content"
+            fi
+            count=$((count + 1))
+            if [[ -n "$req_limit" ]] && (( count >= req_limit )); then log_debug "Reached --limit of $req_limit"; break; fi
+        else
+            local rc=$?
+            if [[ $rc -gt 128 ]]; then
+                if [[ -n "$req_until" ]] && (( $(date +%s) >= req_until )); then log_debug "Reached --until time"; break; fi
+                continue
+            else
+                break
+            fi
+        fi
+    done < <(nak "${nak_args[@]}" 2>"$req_stderr")
+
+    local err_output; err_output=$(<"$req_stderr"); rm -f "$req_stderr"
+    if [[ -n "$err_output" ]]; then
+      if [[ $(echo "$err_output" | wc -l) -eq 1 ]] && [[ "$err_output" =~ \.\.\.\ ok\.$ ]]; then
+        log_debug "nak connected ok: $err_output"
+      else
+        printf '%b[ERROR] nak stderr: %s%b\n' "$COLOR_RED" "$err_output" "$COLOR_RESET" >&2
+      fi
+    fi
+    return 0
+}
+
+cmd_post_get() {
+    log_debug "Executing post get"
+    _fetch_posts "$SINCE" "$UNTIL" "$LIMIT" || exit "$EXIT_ERROR"
+    exit "$EXIT_OK"
+}
+
+cmd_post_listen() {
+    log_debug "Executing post listen"
+    _listen_loop "post"
+}
+
+# ==============================================================================
+# Implementations: Public Channel
+# ==============================================================================
+
+cmd_public_channel_send() {
+    log_debug "Executing public-channel send"
+    require_nsec
+    require_text
+    require_relays
+    if [[ ${#CHANNEL_IDS[@]} -eq 0 ]]; then
+        usage_error "--channel-id is required for public-channel send"
+    fi
+    local -a all_messages=()
+    for t in "${TEXTS[@]}"; do
+        if [[ "$t" == "-" ]]; then
+            all_messages+=("$(cat)")
+        else
+            all_messages+=("$t")
+        fi
+    done
+    for f in "${TEXT_FILES[@]}"; do
+        [[ -f "$f" ]] || fail "Text file not found: $f"
+        all_messages+=("$(cat "$f")")
+    done
+    log_debug "Sending ${#all_messages[@]} message(s) to ${#CHANNEL_IDS[@]} channel(s)"
+    local total_sent=0
+    local total_failed=0
+    for channel_id in "${CHANNEL_IDS[@]}"; do
+        for msg_text in "${all_messages[@]}"; do
+            local stderr_file; stderr_file=$(mktemp)
+            local output
+            local status=0
+            output=$(nak event --sec "$NSEC" -k 42 --tag "e=$channel_id" -c "$msg_text" "${RELAYS[@]}" 2>"$stderr_file") || status=$?
+            local err_output; err_output=$(<"$stderr_file"); rm -f "$stderr_file"
+            if [[ $status -ne 0 ]]; then
+                log_err "Publish failed to channel $(nsec_short "$channel_id"): $err_output"
+                total_failed=$((total_failed + 1))
+                continue
+            fi
+            total_sent=$((total_sent + 1))
+            log_debug "Sent to channel $(nsec_short "$channel_id"): $output"
+        done
+    done
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"sent":%d,"failed":%d,"channels":%d,"messages":%d}\n' "$total_sent" "$total_failed" "${#CHANNEL_IDS[@]}" "${#all_messages[@]}"
+    else
+        if [[ $total_failed -gt 0 ]]; then
+            printf '%bSent %d message(s) (%d failed) to %d channel(s)%b\n' "$COLOR_RED" "$total_sent" "$total_failed" "${#CHANNEL_IDS[@]}" "$COLOR_RESET"
+        else
+            printf '%bSent %d message(s) to %d channel(s)%b\n' "$COLOR_GREEN" "$total_sent" "${#CHANNEL_IDS[@]}" "$COLOR_RESET"
+        fi
+    fi
+    [[ $total_failed -gt 0 ]] && exit "$EXIT_ERROR"
+    exit "$EXIT_OK"
+}
+
+_fetch_channel() {
+    local channel_id="$1"
+    local req_since="$2"
+    local req_until="$3"
+    local req_limit="$4"
+    LAST_FETCH_COUNT=0
+    require_relays
+    local -a nak_args=("req" "-k" "42" "--tag" "e=$channel_id")
+    local effective_limit="${req_limit:-$DEFAULT_GET_LIMIT}"
+    if (( effective_limit > MAX_GET_LIMIT )); then
+        usage_error "--limit $effective_limit exceeds MAX_GET_LIMIT ($MAX_GET_LIMIT). Edit source code to increase."
+    fi
+    if (( effective_limit > 0 )); then
+        nak_args+=("--limit" "$effective_limit")
+    fi
+    if [[ -n "$req_since" ]]; then nak_args+=("--since" "$req_since"); fi
+    if [[ -n "$req_until" ]]; then nak_args+=("--until" "$req_until"); fi
+    if [[ ${#NPUBS[@]} -gt 0 ]]; then
+        log_debug "Filtering channel get by ${#NPUBS[@]} npub(s)"
+        for npub_val in "${NPUBS[@]}"; do
+            local hex
+            if ! hex=$(resolve_token_to_hex "$npub_val"); then
+                log_err "Failed to resolve npub to hex: $npub_val"
+                return 1
+            fi
+            nak_args+=("-a" "$hex")
+            log_debug "Added author (sender) filter: $hex"
+        done
+    fi
+    for relay in "${RELAYS[@]}"; do nak_args+=("$relay"); done
+    log_debug "_fetch_channel: Fetching kind 42 events for channel: $channel_id"
+    local output
+    if ! output=$(run_nak_full nak "${nak_args[@]}"); then
+        return 1
+    fi
+    if [[ -z "$output" ]]; then
+        if [[ $JSON -eq 1 ]]; then printf '[]\n'; else printf 'No messages found.\n'; fi
+        return 0
+    fi
+    # Sort events chronologically (oldest to newest)
+    output=$(printf '%s\n' "$output" | jq -sc 'sort_by(.created_at) | .[]' 2>/dev/null)
+    log_debug "_fetch_channel: sorted output is $output"
+    LAST_FETCH_COUNT=$(printf '%s\n' "$output" | awk 'NF {c++} END {print c+0}')
+    log_debug "_fetch_channel: LAST_FETCH_COUNT is $LAST_FETCH_COUNT"
+    printf '%s\n' "$output" | while IFS= read -r line; do
+	log_debug "_fetch_channel: line is $line"
+        [[ -z "$line" ]] && continue
+        # Execute hook if provided (always gets raw JSON)
+        if [[ -n "$EXEC_CMD" ]]; then
+            _execute_hook "$line"
+        fi
+        if [[ $JSON -eq 1 ]]; then
+            printf '%s\n' "$line"
+        else
+            local ts pubkey content date_str alias_label
+            ts=$(printf '%s' "$line" | jq -r '.created_at // empty' 2>/dev/null)
+            pubkey=$(printf '%s' "$line" | jq -r '.pubkey // empty' 2>/dev/null)
+            content=$(printf '%s' "$line" | jq -r '.content // empty' 2>/dev/null)
+            date_str=""
+            if [[ -n "$ts" ]]; then
+                date_str=$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$ts")
+            fi
+            alias_label=$(format_sender_label "$pubkey")
+            printf '[%s] [%s]: %s\n' "$date_str" "$alias_label" "$content"
+        fi
+    done
+    return 0
+}
+
+_stream_channel() {
+    local channel_id="$1"
+    local req_since="$2"
+    local req_until="$3"
+    local req_limit="$4"
+    require_relays
+    # don't set --limit and --until because they are defined differently for --listen in 0xchat-cli than in nak
+    local -a nak_args=("req" "-k" "42" "--tag" "e=$channel_id" "--stream")
+    if [[ -n "$req_since" ]]; then nak_args+=("--since" "$req_since"); fi
+    if [[ ${#NPUBS[@]} -gt 0 ]]; then
+        log_debug "Filtering channel listen by ${#NPUBS[@]} npub(s)"
+        for npub_val in "${NPUBS[@]}"; do
+            local hex
+            if ! hex=$(resolve_token_to_hex "$npub_val"); then
+                log_err "Failed to resolve npub to hex: $npub_val"
+                return 1
+            fi
+            nak_args+=("-a" "$hex")
+            log_debug "Added author (sender) filter: $hex"
+        done
+    fi
+    for relay in "${RELAYS[@]}"; do nak_args+=("$relay"); done
+    log_debug "Streaming kind 42 events for channel: $channel_id"
+    local req_stderr; req_stderr=$(mktemp)
+
+    local count=0
+    while true; do
+        if IFS= read -t 1 -r line; then
+            if [[ -n "$EXEC_CMD" ]]; then _execute_hook "$line"; fi
+            if [[ $JSON -eq 1 ]]; then
+                printf '%s\n' "$line"
+            else
+                local ts pubkey content date_str alias_label
+                ts=$(printf '%s' "$line" | jq -r '.created_at // empty' 2>/dev/null)
+                pubkey=$(printf '%s' "$line" | jq -r '.pubkey // empty' 2>/dev/null)
+                content=$(printf '%s' "$line" | jq -r '.content // empty' 2>/dev/null)
+                date_str=""
+                if [[ -n "$ts" ]]; then date_str=$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$ts"); fi
+                alias_label=$(format_sender_label "$pubkey")
+                printf '[%s] [%s]: %s\n' "$date_str" "$alias_label" "$content"
+            fi
+            count=$((count + 1))
+            if [[ -n "$req_limit" ]] && (( count >= req_limit )); then log_debug "Reached --limit of $req_limit"; break; fi
+        else
+            local rc=$?
+            if [[ $rc -gt 128 ]]; then
+                if [[ -n "$req_until" ]] && (( $(date +%s) >= req_until )); then log_debug "Reached --until time"; break; fi
+                continue
+            else
+                break
+            fi
+        fi
+    done < <(nak "${nak_args[@]}" 2>"$req_stderr")
+
+    local err_output; err_output=$(<"$req_stderr"); rm -f "$req_stderr"
+    if [[ -n "$err_output" ]]; then
+      if [[ $(echo "$err_output" | wc -l) -eq 1 ]] && [[ "$err_output" =~ \.\.\.\ ok\.$ ]]; then
+        log_debug "nak connected ok: $err_output"
+      else
+        printf '%b[ERROR] nak stderr: %s%b\n' "$COLOR_RED" "$err_output" "$COLOR_RESET" >&2
+      fi
+    fi
+    return 0
+}
+
+cmd_public_channel_get() {
+    log_debug "Executing public-channel get"
+    if [[ ${#CHANNEL_IDS[@]} -eq 0 ]]; then
+        usage_error "--channel-id is required for public-channel get"
+    fi
+    if [[ ${#CHANNEL_IDS[@]} -gt 1 ]]; then
+        usage_error "--channel-id can only be specified exactly once for public-channel get"
+    fi
+    _fetch_channel "${CHANNEL_IDS[0]}" "$SINCE" "$UNTIL" "$LIMIT" || exit "$EXIT_ERROR"
+    exit "$EXIT_OK"
+}
+
+cmd_public_channel_listen() {
+    log_debug "Executing public-channel listen"
+    _listen_loop "public-channel"
+}
+
+# ==============================================================================
+# Implementations: NIP-29 Groups (Open/Closed)
+# ==============================================================================
+
+cmd_nip29_send() {
+    local group_type="$1"
+    require_nsec
+    require_text
+    log_debug "cmd_nip29_send: group_type is $group_type"
+    if [[ "$group_type" == "closed" ]]; then
+        log_debug "For send, get and listen there is NO difference between an open-group and a closed-group. Both are NIP-29, both send, get, listen the same. The difference is in how they are joining the group. Anyone can join an open group unilaterally, joining a closed group requires approval or invitation."
+    fi
+    # NIP29_GROUP_IDS is an array that already has items like: open|123...group-id...abc|wss://groups.0xchat.com
+    # It has gone through resolve_nip29_group() already and is its output.
+    if [[ ${#NIP29_GROUP_IDS[@]} -eq 0 ]]; then usage_error "--group-id is required"; fi
+    local -a resolved_gids=()
+    local -a resolved_relays=()
+    for res in "${NIP29_GROUP_IDS[@]}"; do
+        log_debug "cmd_nip29_send: sending to resolved group $res"
+        local IFS='|'; read -ra parts <<< "$res"
+        local res_gid="${parts[1]}"
+        local res_relay="${parts[2]}"
+        if [[ -z "$res_relay" ]]; then
+            if [[ -z "$NIP29_RELAY" ]]; then usage_error "Group '$res_gid' not found in config or missing relay, and no --relay provided."; fi
+            res_relay="$NIP29_RELAY"
+        fi
+        resolved_gids+=("$res_gid")
+        resolved_relays+=("$res_relay")
+    done
+    log_debug "cmd_nip29_send: sending to these gids (group-ids): ( ${resolved_gids[@]} )"
+    log_debug "cmd_nip29_send: sending to these relays (urls): ( ${resolved_relays[@]} )"
+    local -a all_messages=()
+    for t in "${TEXTS[@]}"; do
+        if [[ "$t" == "-" ]]; then all_messages+=("$(cat)"); else all_messages+=("$t"); fi
+    done
+    for f in "${TEXT_FILES[@]}"; do
+        [[ -f "$f" ]] || fail "Text file not found: $f"
+        all_messages+=("$(cat "$f")")
+    done
+    local total_sent=0
+    local total_failed=0
+    for i in "${!resolved_gids[@]}"; do
+        local gid="${resolved_gids[$i]}"
+        local relay="${resolved_relays[$i]}"
+        for msg in "${all_messages[@]}"; do
+            local stderr_file; stderr_file=$(mktemp)
+            local output; local status=0
+            # NIP-29 group messages use Kind 9 with 'h' tag
+	    local -a nak_args=("event" "--sec" "$NSEC" "-k" "9" "-t" "h=$gid" "-c" "$msg" "$relay")
+            if ! output=$(run_nak_full nak "${nak_args[@]}"); then
+                log_err "Publish failed to group $gid on $relay."
+                total_failed=$((total_failed + 1))
+                continue
+	    fi
+            total_sent=$((total_sent + 1))
+        done
+    done
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"sent":%d,"failed":%d,"groups":%d,"messages":%d}\n' "$total_sent" "$total_failed" "${#resolved_gids[@]}" "${#all_messages[@]}"
+    else
+        if [[ $total_failed -gt 0 ]]; then
+            printf '%bSent %d message(s) (%d failed) to %d group(s)%b\n' "$COLOR_RED" "$total_sent" "$total_failed" "${#resolved_gids[@]}" "$COLOR_RESET"
+        else
+            printf '%bSent %d message(s) to %d group(s)%b\n' "$COLOR_GREEN" "$total_sent" "${#resolved_gids[@]}" "$COLOR_RESET"
+        fi
+    fi
+    [[ $total_failed -gt 0 ]] && exit "$EXIT_ERROR"
+    exit "$EXIT_OK"
+}
+
+_fetch_nip29() {
+    local group_type="$1"
+    local gid="$2"
+    local relay="$3"
+    local req_since="$4"
+    local req_until="$5"
+    local req_limit="$6"
+    LAST_FETCH_COUNT=0
+    require_nsec
+    if [[ "$group_type" == "closed" ]]; then
+        log_debug "For send, get and listen there is NO difference between an open-group and a closed-group. Both are NIP-29, both send, get, listen the same. The difference is in how they are joining the group. Anyone can join an open group unilaterally, joining a closed group requires approval or invitation."
+    fi
+    # nak req -k 9 --auth --sec $NSEC  -h abc...group-id... -a "PUB-HEX-of-SENDER1..."  -a "PUB-HEX-of-SENDER1..."  wss://groups.0xchat.com
+    # This worked. One can optionally filter by SENDER (-a) == author == pubkey; use zero or multiple -a
+    # OPEN-GROUP GET with multiple --npub (sender)
+    # NIP-29 group messages use Kind 9 with 'h' tag
+    local -a nak_args=("req" "-k" "9" "--auth" "--sec" "$NSEC" "-t" "h=$gid")
+    local effective_limit="${req_limit:-$DEFAULT_GET_LIMIT}"
+    if (( effective_limit > MAX_GET_LIMIT )); then
+        usage_error "--limit $effective_limit exceeds MAX_GET_LIMIT ($MAX_GET_LIMIT). Edit source code to increase."
+    fi
+    if (( effective_limit > 0 )); then
+        nak_args+=("--limit" "$effective_limit")
+    fi
+    if [[ -n "$req_since" ]]; then nak_args+=("--since" "$req_since"); fi
+    if [[ -n "$req_until" ]]; then nak_args+=("--until" "$req_until"); fi
+    if [[ ${#NPUBS[@]} -gt 0 ]]; then
+        log_debug "Filtering nip29 get by ${#NPUBS[@]} npub(s)"
+        for npub_val in "${NPUBS[@]}"; do
+            local hex
+            if ! hex=$(resolve_token_to_hex "$npub_val"); then
+                log_err "Failed to resolve npub to hex: $npub_val"
+                return 1
+            fi
+            nak_args+=("-a" "$hex")
+            log_debug "Added author (sender) filter: $hex"
+        done
+    fi
+    nak_args+=("$relay")
+    if ! output=$(run_nak_full nak "${nak_args[@]}"); then return 1; fi
+    if [[ -z "$output" ]]; then
+        if [[ $JSON -eq 1 ]]; then printf '[]\n'; else printf 'No messages found.\n'; fi
+        return 0
+    fi
+    # Sort events chronologically (oldest to newest)
+    output=$(printf '%s\n' "$output" | jq -sc 'sort_by(.created_at) | .[]' 2>/dev/null)
+    log_debug "_fetch_nip29: sorted output is $output"
+    LAST_FETCH_COUNT=$(printf '%s\n' "$output" | awk 'NF {c++} END {print c+0}')
+    log_debug "_fetch_nip29: LAST_FETCH_COUNT is $LAST_FETCH_COUNT"
+    printf '%s\n' "$output" | while IFS= read -r line; do
+        log_debug "_fetch_nip29: fetched line is $line"
+        [[ -z "$line" ]] && continue
+        # Execute hook if provided (always gets raw JSON)
+        if [[ -n "$EXEC_CMD" ]]; then
+            _execute_hook "$line"
+        fi
+        if [[ $JSON -eq 1 ]]; then
+            printf '%s\n' "$line"
+        else
+            local ts pubkey content date_str alias_label
+            ts=$(printf '%s' "$line" | jq -r '.created_at // empty' 2>/dev/null)
+            pubkey=$(printf '%s' "$line" | jq -r '.pubkey // empty' 2>/dev/null)
+            content=$(printf '%s' "$line" | jq -r '.content // empty' 2>/dev/null)
+            date_str=""
+            if [[ -n "$ts" ]]; then
+                date_str=$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$ts")
+            fi
+            alias_label=$(format_sender_label "$pubkey")
+            printf '[%s] [%s]: %s\n' "$date_str" "$alias_label" "$content"
+        fi
+    done
+    return 0
+}
+
+_stream_nip29() {
+    local group_type="$1"
+    local gid="$2"
+    local relay="$3"
+    local req_since="$4"
+    local req_until="$5"
+    local req_limit="$6"
+    require_nsec
+    log_debug "_stream_nip29: relay is $relay"
+    if [[ "$group_type" == "closed" ]]; then
+        log_debug "For send, get and listen there is NO difference between an open-group and a closed-group. Both are NIP-29, both send, get, listen the same. The difference is in how they are joining the group. Anyone can join an open group unilaterally, joining a closed group requires approval or invitation."
+    fi
+    # don't set --limit and --until because they are defined differently for --listen in 0xchat-cli than in nak
+    # nak req -k 9 --auth --sec $NSEC  -h abc...group-id... -a "PUB-HEX-of-SENDER1..."  -a "PUB-HEX-of-SENDER1..."  wss://groups.0xchat.com
+    # This worked. One can optionally filter by SENDER (-a) == author == pubkey; use zero or multiple -a
+    # OPEN-GROUP GET with multiple --npub (sender)
+    local -a nak_args=("req" "-k" "9" "--auth" "--sec" "$NSEC" "-t" "h=$gid" "--stream")
+    if [[ -n "$req_since" ]]; then nak_args+=("--since" "$req_since"); fi
+    if [[ ${#NPUBS[@]} -gt 0 ]]; then
+        log_debug "Filtering nip29 listen by ${#NPUBS[@]} npub(s)"
+        for npub_val in "${NPUBS[@]}"; do
+            local hex
+            if ! hex=$(resolve_token_to_hex "$npub_val"); then
+                log_err "Failed to resolve npub to hex: $npub_val"
+                return 1
+            fi
+            nak_args+=("-a" "$hex")
+            log_debug "Added author (sender) filter: $hex"
+        done
+    fi
+    nak_args+=("$relay")
+    local req_stderr; req_stderr=$(mktemp)
+    log_debug "_stream_nip29: running nak $(sanitize_args_for_log ${nak_args[@]})"
+
+    local count=0
+    while true; do
+        if IFS= read -t 1 -r line; then
+	    if [ -z "$line:-" ]; then
+		log_debug "_stream_nip29: found an empty line. unexpected."
+		continue
+	    fi
+            if [[ -n "$EXEC_CMD" ]]; then _execute_hook "$line"; fi
+            if [[ $JSON -eq 1 ]]; then
+                printf '%s\n' "$line"
+            else
+                local ts pubkey content date_str alias_label
+                ts=$(printf '%s' "$line" | jq -r '.created_at // empty' 2>/dev/null)
+                pubkey=$(printf '%s' "$line" | jq -r '.pubkey // empty' 2>/dev/null)
+                content=$(printf '%s' "$line" | jq -r '.content // empty' 2>/dev/null)
+                date_str=""
+                if [[ -n "$ts" ]]; then date_str=$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$ts"); fi
+                alias_label=$(format_sender_label "$pubkey")
+                printf '[%s] [%s]: %s\n' "$date_str" "$alias_label" "$content"
+            fi
+            count=$((count + 1))
+            if [[ -n "$req_limit" ]] && (( count >= req_limit )); then log_debug "Reached --limit of $req_limit"; break; fi
+        else
+            local rc=$?
+            if [[ $rc -gt 128 ]]; then
+                if [[ -n "$req_until" ]] && (( $(date +%s) >= req_until )); then log_debug "Reached --until time"; break; fi
+                continue
+            else
+                break
+            fi
+        fi
+    done < <(nak "${nak_args[@]}" 2>"$req_stderr")
+
+    local err_output; err_output=$(<"$req_stderr"); rm -f "$req_stderr"
+    if [[ -n "$err_output" ]]; then
+      if [[ $(echo "$err_output" | wc -l) -eq 1 ]] && [[ "$err_output" =~ \.\.\.\ ok\.$ ]]; then
+        log_debug "nak connected ok: $err_output"
+      elif [[ $(echo "$err_output" | wc -l) -eq 2 ]] && [[ "$err_output" =~ \.\.\.\ ok\..*authenticating\ to\ .*\.\.\. ]]; then
+        # connecting to groups.0xchat.com... ok.
+        # authenticating to groups.0xchat.com as npub179…r2c3q...
+        log_debug "nak connected ok, authenticated ok: $err_output"
+      else
+        printf '%b[ERROR] nak stderr: %s%b\n' "$COLOR_RED" "$err_output" "$COLOR_RESET" >&2
+      fi
+    fi
+    return 0
+}
+
+cmd_nip29_get() {
+    local group_type="$1"
+    log_debug "cmd_nip29_get: group_type is $group_type"
+    # NIP29_GROUP_IDS already has items like: open|123...group-id...abc|wss://groups.0xchat.com
+    # It  has gone through resolve_nip29_group() already and is its output.
+    if [[ ${#NIP29_GROUP_IDS[@]} -eq 0 ]]; then usage_error "--group-id is required"; fi
+    if [[ ${#NIP29_GROUP_IDS[@]} -gt 1 ]]; then usage_error "--group-id can only be specified exactly once for get"; fi
+    local res; res="${NIP29_GROUP_IDS[0]}"
+    log_debug "cmd_nip29_get: resolved group is $res"
+    local IFS='|'; read -ra parts <<< "$res"
+    local res_gid="${parts[1]}"
+    local res_relay="${parts[2]}"
+    log_debug "cmd_nip29_get: resolve group info is $res, group-id is $res_gid, group relay is $res_relay"
+    if [[ -z "$res_relay" ]]; then
+        if [[ -z "$NIP29_RELAY" ]]; then usage_error "Group '$res_gid' not found in config or missing relay, and no --relay provided."; fi
+        res_relay="$NIP29_RELAY"
+    fi
+    _fetch_nip29 "$group_type" "$res_gid" "$res_relay" "$SINCE" "$UNTIL" "$LIMIT" || exit "$EXIT_ERROR"
+    exit "$EXIT_OK"
+}
+
+cmd_nip29_listen() {
+    local group_type="$1"
+    _listen_loop "$group_type-group"
+}
+
+# ==============================================================================
+# Implementations: Private-Group Send (v0.31.0 Updated)
+# ==============================================================================
+
+# Resolves group members based on config presence and CLI args
+# Enforces mutual exclusivity: config-driven vs CLI-driven
+resolve_private_group_members() {
+    local group_name="$1"
+    local pg_file="${CONFIG_PRIVATE_GROUPS_PATH:-$DEFAULT_CONFIG_DIR/private-groups.sh}"
+    local -a members=()
+
+    if [[ -f "$pg_file" && ${#CONFIG_PRIVATE_GROUPS[@]} -gt 0 ]]; then
+        # Config file present: --group-name required, --npub forbidden
+        [[ -z "$group_name" ]] && usage_error "--group-name is required when private-groups config exists."
+        [[ ${#NPUBS[@]} -gt 0 ]] && usage_error "--npub is forbidden when private-groups config exists. Define members in the config file."
+
+        local members_str="${CONFIG_PRIVATE_GROUPS[$group_name]:-}"
+        [[ -z "$members_str" ]] && usage_error "Group '$group_name' not found in private-groups config. Available: ${!CONFIG_PRIVATE_GROUPS[*]}"
+
+        # Unify delimiters: replace pipes with newlines
+        members_str="${members_str//|/$'\n'}"
+
+        local -a temp_members=()
+        # Read line-by-line to preserve spaces in aliases like "Bob Smith"
+        while IFS= read -r line; do
+            line="$(trim "$line")"
+            [[ -n "$line" ]] && temp_members+=("$line")
+        done <<< "$members_str"
+
+        for m in "${temp_members[@]}"; do
+            local resolved
+            resolved=$(resolve_npub_token "$m") || { log_err "Failed to resolve group member: $m"; return 1; }
+            members+=("$resolved")
+        done
+    else
+        # No config file: --group-name required, --npub allowed
+        [[ -z "$group_name" ]] && usage_error "--group-name is required."
+        for n in "${NPUBS[@]}"; do
+            local resolved
+            resolved=$(resolve_npub_token "$n") || { log_err "Failed to resolve group member: $n"; return 1; }
+            members+=("$resolved")
+        done
+    fi
+
+    # Always add sender's npub (derived from active nsec), avoiding duplicates
+    local self_hex
+    self_hex=$(run_nak nak key public "$NSEC") || { log_err "Failed to derive pubkey from nsec"; return 1; }
+
+    local has_sender=false
+    for m in "${members[@]}"; do
+        local mhex
+        mhex=$(run_nak nak decode "$m" 2>/dev/null) || continue
+        [[ "$mhex" == "$self_hex" ]] && has_sender=true && break
+    done
+    if [[ "$has_sender" == false ]]; then
+        local self_npub
+        self_npub=$(run_nak nak encode npub "$self_hex") || { log_err "Failed to encode self npub"; return 1; }
+        members+=("$self_npub")
+    fi
+
+    # Deduplicate
+    printf '%s\n' "${members[@]}" | sort -u
+}
+
+cmd_private_group_send() {
+    log_debug "Executing private-group send"
+    require_nsec
+    require_text
+    require_relays
+    require_private_group_name
+
+    # Resolve members using new consolidated logic
+    local -a group_members=()
+    while IFS= read -r m; do
+        [[ -n "$m" ]] && group_members+=("$m")
+    done < <(resolve_private_group_members "$PRIVATE_GROUP_NAME") || exit "$EXIT_ERROR"
+
+    if [[ ${#group_members[@]} -eq 0 ]]; then
+        usage_error "No group members resolved for group '$PRIVATE_GROUP_NAME'"
+    fi
+
+    local -a all_messages=()
+    for t in "${TEXTS[@]}"; do
+        if [[ "$t" == "-" ]]; then
+            all_messages+=("$(cat)")
+        else
+            all_messages+=("$t")
+        fi
+    done
+    for f in "${TEXT_FILES[@]}"; do
+        [[ -f "$f" ]] || fail "Text file not found: $f"
+        all_messages+=("$(cat "$f")")
+    done
+
+    log_debug "Sending ${#all_messages[@]} message(s) to ${#group_members[@]} member(s) in group '${PRIVATE_GROUP_NAME}'"
+
+    local self_hex
+    self_hex=$(run_nak nak key public "$NSEC") || exit "$EXIT_ERROR"
+
+    local -a group_pubkeys=()
+    local -a seen_hexes=()
+    for npub_val in "${group_members[@]}"; do
+        local rhex
+        rhex=$(resolve_token_to_hex "$npub_val") || { log_err "Failed to resolve member: $npub_val"; exit "$EXIT_ERROR"; }
+        local dup=0
+        for s in "${seen_hexes[@]}"; do
+            [[ "$s" == "$rhex" ]] && { dup=1; break; }
+        done
+        if [[ $dup -eq 0 ]]; then
+            group_pubkeys+=("$rhex")
+            seen_hexes+=("$rhex")
+        fi
+    done
+
+    log_debug "Group has ${#group_pubkeys[@]} unique member(s)"
+
+    local -a p_args=()
+    for phex in "${group_pubkeys[@]}"; do
+        p_args+=("-p" "$phex")
+    done
+
+    local total_sent=0
+    local total_failed=0
+    for msg_text in "${all_messages[@]}"; do
+        log_debug "Processing message ${total_sent}+${total_failed}+1 of ${#all_messages[@]}"
+        local kind14_event
+        if ! kind14_event=$(run_nak_full nak event --kind 14 --content "$msg_text" --sec "$NSEC" \
+            "${p_args[@]}" --tag "subject=${PRIVATE_GROUP_NAME}"); then
+            log_err "Failed to create kind-14 event"
+            total_failed=$((total_failed + ${#group_pubkeys[@]}))
+            continue
+        fi
+        log_debug "kind14_event before wrapping: $kind14_event"
+        for member_hex in "${group_pubkeys[@]}"; do
+            log_debug "Wrapping for member $(nsec_short "$member_hex")"
+            local wrapped
+            local wrap_stderr; wrap_stderr=$(mktemp)
+            wrapped=$(printf '%s' "$kind14_event" | nak gift wrap --sec "$NSEC" \
+                --recipient-pubkey "$member_hex" 2>"$wrap_stderr")
+            local wrap_status=$?
+            local wrap_err; wrap_err=$(<"$wrap_stderr"); rm -f "$wrap_stderr"
+            if [[ $wrap_status -ne 0 || -z "$wrapped" ]]; then
+                log_err "Gift wrap failed for member $(nsec_short "$member_hex"): $wrap_err"
+                total_failed=$((total_failed + 1))
+                continue
+            fi
+            local pub_stderr; pub_stderr=$(mktemp)
+            local pub_out
+            pub_out=$(printf '%s' "$wrapped" | nak event "${RELAYS[@]}" 2>"$pub_stderr")
+            local pub_status=$?
+            local pub_err; pub_err=$(<"$pub_stderr"); rm -f "$pub_stderr"
+            if [[ $pub_status -ne 0 ]]; then
+                log_err "Publish failed for member $(nsec_short "$member_hex"): $pub_err"
+                total_failed=$((total_failed + 1))
+                continue
+            fi
+            total_sent=$((total_sent + 1))
+            log_debug "Sent to member $(nsec_short "$member_hex"): $pub_out"
+        done
+    done
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"sent":%d,"failed":%d,"members":%d,"messages":%d,"group":"%s"}\n' \
+            "$total_sent" "$total_failed" "${#group_pubkeys[@]}" "${#all_messages[@]}" "$PRIVATE_GROUP_NAME"
+    else
+        if [[ $total_failed -gt 0 ]]; then
+            printf '%bSent %d wrapped message(s) (%d failed) to %d member(s) in group "%s"%b\n' \
+                "$COLOR_RED" "$total_sent" "$total_failed" "${#group_pubkeys[@]}" "$PRIVATE_GROUP_NAME" "$COLOR_RESET"
+        else
+            printf '%bSent %d wrapped message(s) to %d member(s) in group "%s"%b\n' \
+                "$COLOR_GREEN" "$total_sent" "${#group_pubkeys[@]}" "$PRIVATE_GROUP_NAME" "$COLOR_RESET"
+        fi
+    fi
+    [[ $total_failed -gt 0 ]] && exit "$EXIT_ERROR"
+    exit "$EXIT_OK"
+}
+
+# ==============================================================================
+# Implementations: Contact Send
+# ==============================================================================
+
+cmd_contact_send() {
+    log_debug "Executing contact send"
+    require_nsec
+    require_npub
+    require_text
+    require_relays
+    local -a all_messages=()
+    for t in "${TEXTS[@]}"; do
+        if [[ "$t" == "-" ]]; then
+            all_messages+=("$(cat)")
+        else
+            all_messages+=("$t")
+        fi
+    done
+    for f in "${TEXT_FILES[@]}"; do
+        [[ -f "$f" ]] || fail "Text file not found: $f"
+        all_messages+=("$(cat "$f")")
+    done
+
+    local self_hex
+    self_hex=$(run_nak nak key public "$NSEC") || exit "$EXIT_ERROR"
+
+    local -a target_hexes=()
+    local -a seen_hexes=()
+
+    # NIP-17 Compliance: Sender MUST receive a copy to view in their own client
+    target_hexes+=("$self_hex")
+    seen_hexes+=("$self_hex")
+
+    local total_sent=0
+    local total_failed=0
+
+    for recipient_npub in "${NPUBS[@]}"; do
+        local recipient_hex
+        recipient_hex=$(run_nak nak decode "$recipient_npub") || { log_err "Failed to decode recipient: $recipient_npub"; total_failed=$((total_failed + ${#all_messages[@]})); continue; }
+        local dup=0
+        for s in "${seen_hexes[@]}"; do
+            [[ "$s" == "$recipient_hex" ]] && { dup=1; break; }
+        done
+        if [[ $dup -eq 0 ]]; then
+            target_hexes+=("$recipient_hex")
+            seen_hexes+=("$recipient_hex")
+        fi
+    done
+
+    log_debug "Sending ${#all_messages[@]} message(s) to ${#target_hexes[@]} target(s) (including sender)"
+
+    # Build inner p-tags for the Kind 14 event (all participants)
+    local -a inner_p_args=()
+    for phex in "${seen_hexes[@]}"; do
+        inner_p_args+=("-p" "$phex")
+    done
+
+    for target_hex in "${target_hexes[@]}"; do
+        for msg_text in "${all_messages[@]}"; do
+            log_debug "Wrapping DM for target $(nsec_short "$target_hex")"
+            local kind14_event
+	    local -a nak_args=("event" "--sec" "$NSEC" "-k" "14" "-c" "$msg_text" "-p" "${target_hex}")
+            if ! kind14_event=$(run_nak_full nak "${nak_args[@]}"); then
+		log_err "cmd_contact_send: Failed to create kind 14 event"
+		total_failed=$((total_failed + 1))
+		continue
+	    fi
+            local wrapped
+            local wrap_stderr; wrap_stderr=$(mktemp)
+            # NSEC = sender
+            log_debug "Inner Kind 14, before being wrapped: $kind14_event"
+            # Outer wrap targets the specific person who can decrypt it (uses ephemeral key)
+            local -a nak_args=("gift" "wrap" "--sec" "$NSEC" "-p" "${target_hex}")
+            log_debug "cmd_contact_send: running nak: echo '$kind14_event' | nak $(sanitize_args_for_log ${nak_args[@]})"
+            wrapped=$(printf '%s' "$kind14_event" | nak "${nak_args[@]}" 2>"$wrap_stderr")
+            local wrap_status=$?
+            local wrap_err; wrap_err=$(<"$wrap_stderr"); rm -f "$wrap_stderr"
+            if [[ $wrap_status -ne 0 ]]; then
+                log_err "Gift wrap failed for recipient $(nsec_short "$recipient_npub"): $wrap_err"
+                total_failed=$((total_failed + 1))
+                continue
+            fi
+            local stderr_file; stderr_file=$(mktemp)
+            local pub_out
+            log_debug "cmd_contact_send: running nak: echo '$wrapped' | nak event ${RELAYS[@]}"
+            pub_out=$(printf '%s' "$wrapped" | nak event "${RELAYS[@]}" 2>"$stderr_file")
+            local pub_status=$?
+            local err_output; err_output=$(<"$stderr_file"); rm -f "$stderr_file"
+	    # err_output always contains something, even on success it coaintains: ...connecting ... ok.
+	    if [[ "$err_output" == *"failed"* ]]; then
+		log_err "Publish failed for recipient $(nsec_short "$recipient_npub"): $err_output"
+                total_failed=$((total_failed + 1))
+                continue
+	    fi
+            if [[ $pub_status -ne 0 ]]; then
+                log_err "Publish failed for recipient $(nsec_short "$recipient_npub"): $err_output"
+                total_failed=$((total_failed + 1))
+                continue
+            fi
+            total_sent=$((total_sent + 1))
+            log_debug "DM sent to $(nsec_short "$recipient_npub"): $pub_out"
+        done
+    done
+    if [[ $JSON -eq 1 ]]; then
+        printf '{"sent":%d,"failed":%d,"recipients":%d,"messages":%d}\n' "$total_sent" "$total_failed" "${#target_hexes[@]}" "${#all_messages[@]}"
+    else
+        if [[ $total_failed -gt 0 ]]; then
+            printf '%bSent %d DM(s) (%d failed) to %d recipient(s) (includes copy(ies) to sender)%b\n' "$COLOR_RED" "$total_sent" "$total_failed" "${#target_hexes[@]}" "$COLOR_RESET"
+        else
+            printf '%bSent %d DM(s) to %d recipient(s) (includes copy(ies) to sender)%b\n' "$COLOR_GREEN" "$total_sent" "${#target_hexes[@]}" "$COLOR_RESET"
+        fi
+    fi
+    [[ $total_failed -gt 0 ]] && exit "$EXIT_ERROR"
+    exit "$EXIT_OK"
+}
+
+# ==============================================================================
+# Shared: Fetch & Unwrap (for contact get / private-group get)
+# ==============================================================================
+
+EXPECTED_GROUP_MEMBERS=()
+
+_fetch_and_unwrap() {
+    local mode="$1"
+    local req_since="$2"
+    local req_until="$3"
+    local req_limit="$4"
+    LAST_FETCH_COUNT=0
+    require_nsec
+    require_relays
+
+    local self_hex
+    self_hex=$(run_nak nak key public "$NSEC") || return 1
+
+    # NIP-17 Timestamp Randomization Protection
+    local relay_since="$req_since"
+    if [[ ("$mode" == "contact" || "$mode" == "private-group") && -n "$relay_since" ]]; then
+        relay_since=$(( relay_since - 172800 ))
+        (( relay_since < 0 )) && relay_since=0
+    fi
+
+    local -a nak_args=("req" "-k" "1059" "-p" "$self_hex")
+    local effective_limit="${req_limit:-$DEFAULT_GET_LIMIT}"
+    if (( effective_limit > MAX_GET_LIMIT )); then
+        usage_error "--limit $effective_limit exceeds MAX_GET_LIMIT ($MAX_GET_LIMIT). Edit source code to increase."
+    fi
+    if (( effective_limit > 0 )); then
+        nak_args+=("--limit" "$effective_limit")
+    fi
+    if [[ -n "$relay_since" ]]; then nak_args+=("--since" "$relay_since"); fi
+    if [[ -n "$req_until" ]]; then nak_args+=("--until" "$req_until"); fi
+
+    for relay in "${RELAYS[@]}"; do nak_args+=("$relay"); done
+    log_debug "_fetch_and_unwrap: Fetching kind 1059 events for self hex: $self_hex"
+    log_debug "_fetch_and_unwrap: running nak $(sanitize_args_for_log ${nak_args[@]})"
+    local req_stderr; req_stderr=$(mktemp)
+    local req_stdout; req_stdout=$(mktemp)
+    local unwrap_stderr; unwrap_stderr=$(mktemp)
+    local unwrapped
+    nak "${nak_args[@]}" >"$req_stdout" 2>"$req_stderr"
+    local req_status=$?
+    local req_err; req_err=$(<"$req_stderr")
+    if [[ $req_status -ne 0 ]]; then
+        log_err "nak req failed: $req_err"
+        rm -f "$req_stderr" "$req_stdout" "$unwrap_stderr"
+        return 1
+    fi
+    log_debug "wrapped NIP17 object: $(cat "$req_stdout")"
+    unwrapped=$(nak gift unwrap --sec "$NSEC" <"$req_stdout" 2>"$unwrap_stderr")
+    log_debug "unwrapped NIP17 object: $unwrapped"
+    local unwrap_status=$?
+    local unwrap_err; unwrap_err=$(<"$unwrap_stderr")
+    rm -f "$req_stderr" "$req_stdout" "$unwrap_stderr"
+    if [[ -n "$unwrap_err" ]]; then
+        log_debug "nak gift unwrap produced stderr (some events may have been skipped or failed to decrypt): $unwrap_err"
+    fi
+    if [[ -z "$unwrapped" ]]; then
+        if [[ $JSON -eq 1 ]]; then printf '[]\n'; else printf 'No messages found.\n'; fi
+        return 0
+    fi
+    local jq_filter=""
+    if [[ "$mode" == "contact" ]]; then
+        jq_filter='select(([.tags[]? | select(.[0] == "subject")] | length) == 0)'
+    elif [[ "$mode" == "private-group" ]]; then
+        jq_filter='select(([.tags[]? | select(.[0] == "subject")] | length) > 0)'
+        if [[ ${#EXPECTED_GROUP_MEMBERS[@]} -gt 0 ]]; then
+            local hex_array=""
+            for shex in "${EXPECTED_GROUP_MEMBERS[@]}"; do
+                [[ -n "$hex_array" ]] && hex_array+=","
+                hex_array+="\"$shex\""
+            done
+            jq_filter+=" | select(([.tags[]? | select(.[0] == \"p\") | .[1]] | sort) == ([${hex_array}] | sort))"
+            jq_filter+=" | select(([.tags[]? | select(.[0] == \"p\")] | length) == ([${hex_array}] | length))"
+        fi
+    fi
+    if [[ ${#NPUBS[@]} -gt 0 && "$mode" == "contact" ]]; then
+        local -a sender_hexes=()
+        for npub_val in "${NPUBS[@]}"; do
+            local shex
+            shex=$(resolve_token_to_hex "$npub_val") || { log_err "Failed to resolve sender: $npub_val"; return 1; }
+            sender_hexes+=("$shex")
+        done
+        local hex_array=""
+        for shex in "${sender_hexes[@]}"; do
+            [[ -n "$hex_array" ]] && hex_array+=","
+            hex_array+="\"$shex\""
+        done
+        jq_filter+=" | select(.pubkey as \$p | [$hex_array] | index(\$p) != null)"
+    fi
+
+    # Strict inner event time filtering (crucial for NIP-17)
+    if [[ -n "$req_since" ]]; then jq_filter+=" | select(.created_at >= $req_since)"; fi
+    if [[ -n "$req_until" ]]; then jq_filter+=" | select(.created_at <= $req_until)"; fi
+
+    log_debug "Applying jq filter and sorting chronologically: $jq_filter"
+    local filtered
+    # Slurp into array, apply filter, sort by created_at, and unpack back to NDJSON
+    filtered=$(printf '%s\n' "$unwrapped" | jq -c -s "[.[] | $jq_filter] | sort_by(.created_at) | .[]" 2>/dev/null)
+    if [[ -z "$filtered" ]]; then
+        if [[ $JSON -eq 1 ]]; then printf '[]\n'; else printf 'No matching messages found.\n'; fi
+        return 0
+    fi
+    LAST_FETCH_COUNT=$(printf '%s\n' "$filtered" | awk 'NF {c++} END {print c+0}')
+    # Use process substitution to preserve global SEEN_IDS array
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local id
+        id=$(printf '%s' "$line" | jq -r '.id // empty' 2>/dev/null)
+        if [[ -n "$id" ]]; then
+            if [[ -n "${SEEN_IDS[$id]:-}" ]]; then
+                LAST_FETCH_COUNT=$((LAST_FETCH_COUNT - 1))
+                continue
+            fi
+            SEEN_IDS["$id"]=1
+        fi
+
+        # Execute hook if provided (always gets raw JSON)
+        if [[ -n "$EXEC_CMD" ]]; then _execute_hook "$line"; fi
+
+        if [[ $JSON -eq 1 ]]; then
+            printf '%s\n' "$line"
+        else
+            log_debug "Filtered object is: $line"
+            local ts pubkey content subject alias_label
+            ts=$(printf '%s' "$line" | jq -r '.created_at // empty' 2>/dev/null)
+            pubkey=$(printf '%s' "$line" | jq -r '.pubkey // empty' 2>/dev/null)
+            content=$(printf '%s' "$line" | jq -r '.content // empty' 2>/dev/null)
+            subject=$(printf '%s' "$line" | jq -r '(.tags[]? | select(.[0] == "subject") | .[1]) // empty' 2>/dev/null)
+            local date_str=""
+            if [[ -n "$ts" ]]; then
+                date_str=$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$ts")
+            fi
+            alias_label=$(format_sender_label "$pubkey")
+            if [[ "$mode" == "private-group" ]]; then
+                if [[ -n "$PRIVATE_GROUP_NAME" && -n "$subject" && "$subject" != "$PRIVATE_GROUP_NAME" ]]; then
+                    log_debug "Subject tag '$subject' does not match --group-name '$PRIVATE_GROUP_NAME'"
+                    printf '%b[WARNING] Subject tag "%s" does not match --group-name "%s"%b\n' "$COLOR_YELLOW" "$subject" "$PRIVATE_GROUP_NAME" "$COLOR_RESET" >&2
+                fi
+                if [[ -n "$subject" ]]; then
+                    printf '[%s] [%s] #%s: %s\n' "$date_str" "$alias_label" "$subject" "$content"
+                else
+                    printf '[%s] [%s]: %s\n' "$date_str" "$alias_label" "$content"
+                fi
+            else
+                printf '[%s] [%s]: %s\n' "$date_str" "$alias_label" "$content"
+            fi
+        fi
+    done < <(printf '%s\n' "$filtered")
+    return 0
+}
+
+_stream_and_unwrap() {
+    local mode="$1"
+    local req_since="$2"
+    local req_until="$3"
+    local req_limit="$4"
+    require_nsec
+    require_relays
+
+    local self_hex
+    self_hex=$(run_nak nak key public "$NSEC") || return 1
+
+    # don't set --limit and --until because they are defined differently for --listen in 0xchat-cli than in nak
+
+    # NIP-17 Timestamp Randomization Protection
+    local relay_since="$req_since"
+    if [[ ("$mode" == "contact" || "$mode" == "private-group") && -n "$relay_since" ]]; then
+        relay_since=$(( relay_since - 172800 ))
+        (( relay_since < 0 )) && relay_since=0
+    fi
+
+    local -a nak_args=("req" "-k" "1059" "-p" "$self_hex" "--stream")
+    if [[ -n "$relay_since" ]]; then nak_args+=("--since" "$relay_since"); fi
+    for relay in "${RELAYS[@]}"; do nak_args+=("$relay"); done
+    # Note: We DO NOT filter by sender pubkey with "nak -a xxx" because
+    # the outer Kind 1059 event is signed by an ephemeral key, not the real sender.
+    # We must filter by the real sender's pubkey AFTER decrypting the inner event.
+    log_debug "Streaming kind 1059 events: nak ${nak_args[*]}"
+    local req_stderr; req_stderr=$(mktemp)
+
+    local count=0
+    while true; do
+        if IFS= read -t 1 -r line; then
+            local unwrapped
+            unwrapped=$(printf '%s' "$line" | nak gift unwrap --sec "$NSEC" 2>/dev/null)
+            if [[ -z "$unwrapped" ]]; then continue; fi
+
+
+
+        local jq_filter=""
+        if [[ "$mode" == "contact" ]]; then
+            jq_filter='select(([.tags[]? | select(.[0] == "subject")] | length) == 0)'
+            if [[ ${#NPUBS[@]} -gt 0 ]]; then
+                local hex_array=""
+                for npub_val in "${NPUBS[@]}"; do
+                    local shex
+                    shex=$(resolve_token_to_hex "$npub_val" 2>/dev/null) || continue
+                    [[ -n "$hex_array" ]] && hex_array+=","
+                    hex_array+="\"$shex\""
+                done
+                if [[ -n "$hex_array" ]]; then
+                    jq_filter+=" | select(.pubkey as \$p | [$hex_array] | index(\$p) != null)"
+                fi
+            fi
+        elif [[ "$mode" == "private-group" ]]; then
+                jq_filter='select(([.tags[]? | select(.[0] == "subject")] | length) > 0)'
+                if [[ ${#EXPECTED_GROUP_MEMBERS[@]} -gt 0 ]]; then
+                    local hex_array=""
+                    for shex in "${EXPECTED_GROUP_MEMBERS[@]}"; do
+                        [[ -n "$hex_array" ]] && hex_array+=","
+                        hex_array+="\"$shex\""
+                    done
+                    jq_filter+=" | select(([.tags[]? | select(.[0] == \"p\") | .[1]] | sort) == ([${hex_array}] | sort))"
+                    jq_filter+=" | select(([.tags[]? | select(.[0] == \"p\")] | length) == ([${hex_array}] | length))"
+                fi
+        fi
+
+        # Strict inner event time filtering (crucial for NIP-17)
+        if [[ -n "$req_since" ]]; then jq_filter+=" | select(.created_at >= $req_since)"; fi
+        if [[ -n "$req_until" ]]; then jq_filter+=" | select(.created_at <= $req_until)"; fi
+
+        local filtered
+        filtered=$(printf '%s' "$unwrapped" | jq -c "$jq_filter" 2>/dev/null)
+        if [[ -n "$filtered" ]]; then
+            local id
+            id=$(printf '%s' "$filtered" | jq -r '.id // empty' 2>/dev/null)
+            if [[ -n "$id" ]]; then
+                if [[ -n "${SEEN_IDS[$id]:-}" ]]; then continue; fi
+                SEEN_IDS["$id"]=1
+            fi
+
+            if [[ -n "$EXEC_CMD" ]]; then _execute_hook "$filtered"; fi
+
+
+
+                if [[ $JSON -eq 1 ]]; then
+                    printf '%s\n' "$filtered"
+                else
+                    local ts pubkey content subject alias_label date_str
+                    ts=$(printf '%s' "$filtered" | jq -r '.created_at // empty' 2>/dev/null)
+                    pubkey=$(printf '%s' "$filtered" | jq -r '.pubkey // empty' 2>/dev/null)
+                    content=$(printf '%s' "$filtered" | jq -r '.content // empty' 2>/dev/null)
+                    subject=$(printf '%s' "$filtered" | jq -r '(.tags[]? | select(.[0] == "subject") | .[1]) // empty' 2>/dev/null)
+                    date_str=""
+                    if [[ -n "$ts" ]]; then date_str=$(date -d "@$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$ts" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$ts"); fi
+                    alias_label=$(format_sender_label "$pubkey")
+                    if [[ "$mode" == "private-group" ]]; then
+                        if [[ -n "$PRIVATE_GROUP_NAME" && -n "$subject" && "$subject" != "$PRIVATE_GROUP_NAME" ]]; then
+                            printf '%b[WARNING] Subject tag "%s" does not match --group-name "%s"%b\n' "$COLOR_YELLOW" "$subject" "$PRIVATE_GROUP_NAME" "$COLOR_RESET" >&2
+                        fi
+                        if [[ -n "$subject" ]]; then
+                            printf '[%s] [%s] #%s: %s\n' "$date_str" "$alias_label" "$subject" "$content"
+                        else
+                            printf '[%s] [%s]: %s\n' "$date_str" "$alias_label" "$content"
+                        fi
+                    else
+                        printf '[%s] [%s]: %s\n' "$date_str" "$alias_label" "$content"
+                    fi
+                fi
+                count=$((count + 1))
+                if [[ -n "$req_limit" ]] && (( count >= req_limit )); then log_debug "Reached --limit of $req_limit"; break; fi
+            fi
+        else
+            local rc=$?
+            if [[ $rc -gt 128 ]]; then
+                if [[ -n "$req_until" ]] && (( $(date +%s) >= req_until )); then log_debug "Reached --until time"; break; fi
+                continue
+            else
+                break
+            fi
+        fi
+    done < <(nak "${nak_args[@]}" 2>"$req_stderr")
+
+    local err_output; err_output=$(<"$req_stderr"); rm -f "$req_stderr"
+    if [[ -n "$err_output" ]]; then
+      if [[ $(echo "$err_output" | wc -l) -eq 1 ]] && [[ "$err_output" =~ \.\.\.\ ok\.$ ]]; then
+        log_debug "nak connected ok: $err_output"
+      else
+        printf '%b[ERROR] nak stderr: %s%b\n' "$COLOR_RED" "$err_output" "$COLOR_RESET" >&2
+      fi
+    fi
+    return 0
+}
+
+# ==============================================================================
+# NEW: Hook Execution Function (v0.32.0)
+# ==============================================================================
+
+# Executes the --exec command for a received message
+# - Pipes raw JSON event to stdin
+# - Sets OXCHATCLI_* environment variables for metadata
+# - Runs in background (&) to avoid blocking the listener
+_execute_hook() {
+    local event_json="$1"
+    [[ -z "$EXEC_CMD" || -z "$event_json" ]] && return 0
+
+    # Extract metadata for environment variables
+    local exec_kind exec_pubkey exec_npub exec_alias exec_content exec_created_at
+    exec_kind=$(printf '%s' "$event_json" | jq -r '.kind // empty' 2>/dev/null)
+    exec_pubkey=$(printf '%s' "$event_json" | jq -r '.pubkey // empty' 2>/dev/null)
+    exec_content=$(printf '%s' "$event_json" | jq -r '.content // empty' 2>/dev/null)
+    exec_created_at=$(printf '%s' "$event_json" | jq -r '.created_at // empty' 2>/dev/null)
+
+    # Resolve npub and alias
+    exec_npub=""
+    [[ -n "$exec_pubkey" ]] && exec_npub=$(run_nak nak encode npub "$exec_pubkey" 2>/dev/null) || exec_npub=""
+    exec_alias=$(lookup_alias_for_hex "$exec_pubkey" 2>/dev/null) || exec_alias=""
+
+    # Execute the command in a subshell, piping the raw JSON to stdin
+    # We use env to inject variables safely without polluting the main CLI environment
+    # The & runs it in background so slow commands don't block the listener
+    printf '%s\n' "$event_json" | env \
+        OXCHATCLI_KIND="$exec_kind" \
+        OXCHATCLI_PUBKEY="$exec_pubkey" \
+        OXCHATCLI_NPUB_SENDER="$exec_npub" \
+        OXCHATCLI_ALIAS="$exec_alias" \
+        OXCHATCLI_CONTENT="$exec_content" \
+        OXCHATCLI_GROUP_NAME="${PRIVATE_GROUP_NAME:-}" \
+        OXCHATCLI_GROUP_ID="${NIP29_RESOLVED_GID:-}" \
+        OXCHATCLI_CHANNEL_ID="${CHANNEL_IDS[0]:-}" \
+        OXCHATCLI_CREATED_AT="$exec_created_at" \
+        bash -c "$EXEC_CMD" 2>/dev/null &
+}
+
+# ==============================================================================
+# Implementations: Contact Get / Private-Group Get & Listen Loops
+# ==============================================================================
+
+cmd_contact_get() {
+    log_debug "Executing contact get"
+    _fetch_and_unwrap "contact" "$SINCE" "$UNTIL" "$LIMIT" || exit "$EXIT_ERROR"
+    exit "$EXIT_OK"
+}
+
+cmd_private_group_get() {
+    log_debug "Executing private-group get"
+    require_nsec
+    require_private_group_name
+    require_relays
+
+    # Resolve members using new consolidated logic
+    local -a group_members=()
+    while IFS= read -r m; do
+        [[ -n "$m" ]] && group_members+=("$m")
+    done < <(resolve_private_group_members "$PRIVATE_GROUP_NAME") || exit "$EXIT_ERROR"
+
+    # Build EXPECTED_GROUP_MEMBERS for jq filtering
+    EXPECTED_GROUP_MEMBERS=()
+    for npub_val in "${group_members[@]}"; do
+        local rhex
+        rhex=$(resolve_token_to_hex "$npub_val") || { log_err "Failed to resolve member: $npub_val"; exit "$EXIT_ERROR"; }
+        EXPECTED_GROUP_MEMBERS+=("$rhex")
+    done
+
+    # Deduplicate
+    local -a unique_expected=()
+    for m in "${EXPECTED_GROUP_MEMBERS[@]}"; do
+        local dup=0
+        for u in "${unique_expected[@]}"; do [[ "$u" == "$m" ]] && { dup=1; break; }; done
+        [[ $dup -eq 0 ]] && unique_expected+=("$m")
+    done
+    EXPECTED_GROUP_MEMBERS=("${unique_expected[@]}")
+
+    _fetch_and_unwrap "private-group" "$SINCE" "$UNTIL" "$LIMIT" || exit "$EXIT_ERROR"
+    exit "$EXIT_OK"
+}
+
+_listen_loop() {
+    local mode="$1"
+    if [[ "$mode" == "private-group" ]]; then
+        require_nsec
+        require_private_group_name
+        require_relays
+
+        local -a group_members=()
+        while IFS= read -r m; do
+            [[ -n "$m" ]] && group_members+=("$m")
+        done < <(resolve_private_group_members "$PRIVATE_GROUP_NAME") || exit "$EXIT_ERROR"
+
+        EXPECTED_GROUP_MEMBERS=()
+        for npub_val in "${group_members[@]}"; do
+            local rhex
+            rhex=$(resolve_token_to_hex "$npub_val") || { log_err "Failed to resolve member: $npub_val"; exit "$EXIT_ERROR"; }
+            EXPECTED_GROUP_MEMBERS+=("$rhex")
+        done
+        local -a unique_expected=()
+        for m in "${EXPECTED_GROUP_MEMBERS[@]}"; do
+            local dup=0
+            for u in "${unique_expected[@]}"; do [[ "$u" == "$m" ]] && { dup=1; break; }; done
+            [[ $dup -eq 0 ]] && unique_expected+=("$m")
+        done
+        EXPECTED_GROUP_MEMBERS=("${unique_expected[@]}")
+    elif [[ "$mode" == "contact" ]]; then
+        require_nsec
+        require_relays
+    elif [[ "$mode" == "post" ]]; then
+        require_relays
+    elif [[ "$mode" == "public-channel" ]]; then
+        require_relays
+        if [[ ${#CHANNEL_IDS[@]} -eq 0 ]]; then usage_error "--channel-id is required for public-channel listen"; fi
+        if [[ ${#CHANNEL_IDS[@]} -gt 1 ]]; then usage_error "--channel-id can only be specified exactly once for public-channel listen"; fi
+    elif [[ "$mode" == "open-group" || "$mode" == "closed-group" ]]; then
+        require_relays
+        # NIP29_GROUP_IDS already has items like: open|123...group-id...abc|wss://groups.0xchat.com
+        # It has gone through resolve_nip29_group() already and is its output.
+        if [[ ${#NIP29_GROUP_IDS[@]} -eq 0 ]]; then usage_error "--group-id is required for ${mode} listen"; fi
+        if [[ ${#NIP29_GROUP_IDS[@]} -gt 1 ]]; then usage_error "--group-id can only be specified exactly once for ${mode} listen"; fi
+        local res; res="${NIP29_GROUP_IDS[0]}"
+        log_debug "_listen_loop: resolved group is $res"
+        local IFS='|'; read -ra parts <<< "$res"
+        local NIP29_RESOLVED_TYPE="${parts[0]}"
+        local NIP29_RESOLVED_GID="${parts[1]}"
+        local NIP29_RESOLVED_RELAY="${parts[2]}"
+        log_debug "_listen_loop: resolve group info: $NIP29_RESOLVED_TYPE, $NIP29_RESOLVED_GID, $NIP29_RESOLVED_RELAY"
+        if [[ -z "$NIP29_RESOLVED_RELAY" ]]; then
+            if [[ -z "$NIP29_RELAY" ]]; then usage_error "Group '$NIP29_RESOLVED_GID' not found in config or missing relay, and no --relay provided."; fi
+            NIP29_RESOLVED_RELAY="$NIP29_RELAY"
+        fi
+    fi
+
+    local user_since="$SINCE"
+    local user_until="$UNTIL"
+    local user_limit="$LIMIT"
+
+    # in order to sort the streaming we break the listen into 2 parts:
+    # Phase 1: backfilling without --stream --> sorting
+    # Phase 2: streaming the future with --stream --> we don't do any sorting but assume it is sorted as it is coming in real-time
+
+    # PHASE 1: Chronological Backfill (if --since is provided)
+    if [[ -n "$user_since" ]]; then
+        printf '%bBackfilling old %s messages...%b\n' "$COLOR_GREEN" "$mode" "$COLOR_RESET" >&2
+        log_debug "Performing chronological backfill from $user_since"
+        if [[ "$mode" == "post" ]]; then
+            _fetch_posts "$user_since" "$user_until" "$user_limit" || exit "$EXIT_ERROR"
+        elif [[ "$mode" == "public-channel" ]]; then
+            _fetch_channel "${CHANNEL_IDS[0]}" "$user_since" "$user_until" "$user_limit" || exit "$EXIT_ERROR"
+        elif [[ "$mode" == "open-group" || "$mode" == "closed-group" ]]; then
+            _fetch_nip29 "$NIP29_RESOLVED_TYPE" "$NIP29_RESOLVED_GID" "$NIP29_RESOLVED_RELAY" "$user_since" "$user_until" "$user_limit" || exit "$EXIT_ERROR"
+        else
+            _fetch_and_unwrap "$mode" "$user_since" "$user_until" "$user_limit" || exit "$EXIT_ERROR"
+        fi
+
+        # If the user specified a limit and we already reached it during backfill, we are done.
+        if [[ -n "$user_limit" ]] && (( LAST_FETCH_COUNT >= user_limit )); then
+            log_debug "Reached --limit of $user_limit during backfill. Exiting."
+            exit "$EXIT_OK"
+        fi
+
+        # If the user specified an --until time that is already in the past, we are done.
+        if [[ -n "$user_until" ]] && (( user_until < $(date +%s) )); then
+            log_debug "Reached --until time during backfill. Exiting."
+            exit "$EXIT_OK"
+        fi
+
+        # Update since to "now" so the live stream doesn't repeat the backfilled events
+        user_since=$(date +%s)
+        log_debug "Backfill complete. Transitioning to live stream from $user_since"
+    else
+        log_debug "No Backfilling of old $mode messages needed."
+        # No backfill requested, default to "now"
+        user_since=$(date +%s)
+        log_debug "Defaulting --since to now ($user_since) for live stream"
+    fi
+
+    # PHASE 2: Live Real-Time Streaming
+    printf '%bListening for new %s messages in real-time... (Press Ctrl+C to stop)%b\n' "$COLOR_GREEN" "$mode" "$COLOR_RESET" >&2
+    trap 'printf "\n%bShutting down listener gracefully...%b\n" "$COLOR_YELLOW" "$COLOR_RESET" >&2; exit "$EXIT_OK"' INT TERM
+
+    # Adjust limit for the stream if a limit was provided and partially consumed during backfill
+    local stream_limit="$user_limit"
+    if [[ -n "$user_limit" ]]; then
+        stream_limit=$(( user_limit - LAST_FETCH_COUNT ))
+    fi
+
+    if [[ "$mode" == "post" ]]; then
+        _stream_posts "$user_since" "$user_until" "$stream_limit" || exit "$EXIT_ERROR"
+    elif [[ "$mode" == "public-channel" ]]; then
+        _stream_channel "${CHANNEL_IDS[0]}" "$user_since" "$user_until" "$stream_limit" || exit "$EXIT_ERROR"
+    elif [[ "$mode" == "open-group" || "$mode" == "closed-group" ]]; then
+        _stream_nip29 "$NIP29_RESOLVED_TYPE" "$NIP29_RESOLVED_GID" "$NIP29_RESOLVED_RELAY" "$user_since" "$user_until" "$stream_limit" || exit "$EXIT_ERROR"
+    else
+        _stream_and_unwrap "$mode" "$user_since" "$user_until" "$stream_limit" || exit "$EXIT_ERROR"
+    fi
+
+    trap - INT TERM
+    printf '%bListening complete.%b\n' "$COLOR_GREEN" "$COLOR_RESET" >&2
+    exit "$EXIT_OK"
+}
+
+cmd_contact_listen() {
+    log_debug "Executing contact listen"
+    _listen_loop "contact"
+}
+
+cmd_private_group_listen() {
+    log_debug "Executing private-group listen"
+    _listen_loop "private-group"
+}
+
+# ==============================================================================
+# Self-Test
+# ==============================================================================
+
+run_self_test() {
+    log_debug "Entering run_self_test"
+    local total_tests=0
+    local passed_tests=0
+    local failed_tests=0
+    local test_nsec="nsec1yhwks43ydp3t04yrkm0yrnhmtmqrn0895alcgyu2djkt23vkxc7qmq3959"
+    local test_private_hex="25dd6856246862b7d483b6de41cefb5ec039bce5a77f84138a6cacb54596363c"
+    local test_public_hex
+    test_public_hex=$(nak key public "$test_nsec" 2>/dev/null) || test_public_hex=""
+    local test_npub
+    test_npub=$(nak encode npub "$test_public_hex" 2>/dev/null) || test_npub=""
+    local stderr_file
+    stderr_file=$(mktemp)
+
+    total_tests=$((total_tests + 1))
+    printf 'Running self-test 1: key convert-nsec-to-hex... ' >&2
+    local test1_output
+    test1_output=$( NSEC="$test_nsec" JSON=0 cmd_key_convert_nsec_to_hex 2>"$stderr_file" )
+    local test1_status=$?
+    if [[ $test1_status -eq 0 && "$test1_output" == "$test_private_hex" ]]; then
+        printf '%bPASSED%b\n' "$COLOR_GREEN" "$COLOR_RESET" >&2
+        passed_tests=$((passed_tests + 1))
+    else
+        printf '%bFAILED%b\n' "$COLOR_RED" "$COLOR_RESET" >&2
+        log_err "  Expected: $test_private_hex"
+        log_err "  Got:      ${test1_output:-<empty>} (exit $test1_status)"
+        [[ -s "$stderr_file" ]] && log_err "  Stderr: $(cat "$stderr_file")"
+        failed_tests=$((failed_tests + 1))
+    fi
+
+    total_tests=$((total_tests + 1))
+    printf 'Running self-test 2: key convert-hex-to-nsec... ' >&2
+    local test2_output
+    test2_output=$( HEX_VALUE="$test_private_hex" JSON=0 cmd_key_convert_hex_to_nsec 2>"$stderr_file" )
+    local test2_status=$?
+    if [[ $test2_status -eq 0 && "$test2_output" == "$test_nsec" ]]; then
+        printf '%bPASSED%b\n' "$COLOR_GREEN" "$COLOR_RESET" >&2
+        passed_tests=$((passed_tests + 1))
+    else
+        printf '%bFAILED%b\n' "$COLOR_RED" "$COLOR_RESET" >&2
+        log_err "  Expected: $test_nsec"
+        log_err "  Got:      ${test2_output:-<empty>} (exit $test2_status)"
+        [[ -s "$stderr_file" ]] && log_err "  Stderr: $(cat "$stderr_file")"
+        failed_tests=$((failed_tests + 1))
+    fi
+
+    if [[ -n "$test_public_hex" && -n "$test_npub" ]]; then
+        total_tests=$((total_tests + 1))
+        printf 'Running self-test 3: key derive-npub... ' >&2
+        local test3_output
+        test3_output=$( NSEC="$test_nsec" JSON=0 cmd_key_derive_npub 2>"$stderr_file" )
+        local test3_status=$?
+        if [[ $test3_status -eq 0 && "$test3_output" == "$test_npub" ]]; then
+            printf '%bPASSED%b\n' "$COLOR_GREEN" "$COLOR_RESET" >&2
+            passed_tests=$((passed_tests + 1))
+        else
+            printf '%bFAILED%b\n' "$COLOR_RED" "$COLOR_RESET" >&2
+            log_err "  Expected: $test_npub"
+            log_err "  Got:      ${test3_output:-<empty>} (exit $test3_status)"
+            [[ -s "$stderr_file" ]] && log_err "  Stderr: $(cat "$stderr_file")"
+            failed_tests=$((failed_tests + 1))
+        fi
+    else
+        log_err "Skipped self-test 3 (derive-npub): Could not dynamically compute expected npub via nak."
+    fi
+
+    total_tests=$((total_tests + 1))
+    printf 'Running self-test 4: key generate... ' >&2
+    local test4_output
+    test4_output=$( JSON=0 cmd_key_generate 2>"$stderr_file" )
+    local test4_status=$?
+    if [[ $test4_status -eq 0 && -n "$test4_output" ]]; then
+        printf '%bPASSED%b\n' "$COLOR_GREEN" "$COLOR_RESET" >&2
+        passed_tests=$((passed_tests + 1))
+    else
+        printf '%bFAILED%b\n' "$COLOR_RED" "$COLOR_RESET" >&2
+        log_err "  Expected: non-empty output and exit 0"
+        log_err "  Got:      ${test4_output:-<empty>} (exit $test4_status)"
+        [[ -s "$stderr_file" ]] && log_err "  Stderr: $(cat "$stderr_file")"
+        failed_tests=$((failed_tests + 1))
+    fi
+
+    total_tests=$((total_tests + 1))
+    printf 'Running self-test 5: key roundtrip (generate+derive+convert)... ' >&2
+    local gen_output
+    gen_output=$( JSON=1 DEBUG=$DEBUG cmd_key_generate 2>"$stderr_file" )
+    log_debug "generated key: " $gen_output
+    local gen_status=$?
+    if [[ $gen_status -eq 0 && -n "$gen_output" ]]; then
+        local gen_nsec gen_public_hex gen_npub
+        gen_nsec=$(printf '%s' "$gen_output" | jq -r '.nsec // empty')
+        gen_public_hex=$(printf '%s' "$gen_output" | jq -r '.public_hex // empty')
+        gen_npub=$(printf '%s' "$gen_output" | jq -r '.npub // empty')
+
+        if [[ -n "$gen_nsec" && -n "$gen_public_hex" && -n "$gen_npub" ]]; then
+            local derived_hex
+            derived_hex=$(
+                NSEC="$gen_nsec"
+                JSON=0
+                DEBUG="$DEBUG"
+                cmd_key_derive_public_hex 2>"$stderr_file"
+            )
+            local converted_hex
+            converted_hex=$(
+                NPUBS=("$gen_npub")
+                JSON=0
+                DEBUG="$DEBUG"
+                cmd_key_convert_npub_to_hex 2>"$stderr_file"
+            )
+            log_debug "converted_hex $converted_hex , "  $(cat "$stderr_file")
+            if [[ "$derived_hex" == "$gen_public_hex" && "$converted_hex" == "$gen_public_hex" ]]; then
+                printf '%bPASSED%b\n' "$COLOR_GREEN" "$COLOR_RESET" >&2
+                passed_tests=$((passed_tests + 1))
+            else
+                printf '%bFAILED%b\n' "$COLOR_RED" "$COLOR_RESET" >&2
+                log_err "  Generated public_hex: $gen_public_hex"
+                log_err "  Derived public_hex:   ${derived_hex:-<empty>}"
+                log_err "  Converted from npub:  ${converted_hex:-<empty>}"
+                failed_tests=$((failed_tests + 1))
+            fi
+        else
+            printf '%bFAILED%b\n' "$COLOR_RED" "$COLOR_RESET" >&2
+            log_err "  Could not parse generate JSON output: $gen_output"
+            failed_tests=$((failed_tests + 1))
+        fi
+    else
+        printf '%bFAILED%b\n' "$COLOR_RED" "$COLOR_RESET" >&2
+        log_err "  key generate failed (exit $gen_status)"
+        [[ -s "$stderr_file" ]] && log_err "  Stderr: $(cat "$stderr_file")"
+        failed_tests=$((failed_tests + 1))
+    fi
+
+    total_tests=$((total_tests + 1))
+    printf 'Running self-test 6: --nsec private hex acceptance... ' >&2
+    local test6_nsec=""
+    test6_nsec=$(resolve_identity_token "$test_private_hex" 2>"$stderr_file")
+    local test6_status=$?
+    if [[ $test6_status -eq 0 && "$test6_nsec" == "$test_nsec" ]]; then
+        printf '%bPASSED%b\n' "$COLOR_GREEN" "$COLOR_RESET" >&2
+        passed_tests=$((passed_tests + 1))
+    else
+        printf '%bFAILED%b\n' "$COLOR_RED" "$COLOR_RESET" >&2
+        log_err "  Expected: $test_nsec"
+        log_err "  Got:      ${test6_nsec:-<empty>} (exit $test6_status)"
+        failed_tests=$((failed_tests + 1))
+    fi
+
+    if [[ ${#RELAYS[@]} -gt 0 ]]; then
+        total_tests=$((total_tests + 1))
+        printf 'Running self-test 7: profile set+get roundtrip... ' >&2
+        local pname="0xchat-cli-selftest-$$"
+        local ps_out
+        ps_out=$( NSEC="$test_nsec" PROFILE_NAME="$pname" JSON=1 cmd_profile_set 2>"$stderr_file" )
+        local ps_status=$?
+        if [[ $ps_status -eq 0 ]]; then
+            sleep 2
+            local pg_out
+            pg_out=$(
+                NPUBS=("$test_public_hex")
+                LIMIT="3"
+                JSON=1
+                cmd_profile_get 2>"$stderr_file"
+            )
+            local pg_status=$?
+            if [[ $pg_status -eq 0 ]] && printf '%s' "$pg_out" | grep -qF "$pname"; then
+                printf '%bPASSED%b\n' "$COLOR_GREEN" "$COLOR_RESET" >&2
+                passed_tests=$((passed_tests + 1))
+            else
+                printf '%bFAILED%b\n' "$COLOR_RED" "$COLOR_RESET" >&2
+                log_err "  Profile set succeeded but get did not find name: $pname"
+                log_err "  Get output: ${pg_out:-<empty>} (exit $pg_status)"
+                [[ -s "$stderr_file" ]] && log_err "  Stderr: $(cat "$stderr_file")"
+                failed_tests=$((failed_tests + 1))
+            fi
+        else
+            printf '%bFAILED%b\n' "$COLOR_RED" "$COLOR_RESET" >&2
+            log_err "  profile set failed (exit $ps_status)"
+            [[ -s "$stderr_file" ]] && log_err "  Stderr: $(cat "$stderr_file")"
+            failed_tests=$((failed_tests + 1))
+        fi
+    else
+        total_tests=$((total_tests + 1))
+        printf 'Running self-test 7: profile set+get roundtrip... SKIPPED (no relays)\n' >&2
+    fi
+
+    rm -f "$stderr_file"
+    echo "" >&2
+    if [[ $failed_tests -eq 0 ]]; then
+        printf '%b%d of %d tests succeeded%b\n' "$COLOR_GREEN" "$passed_tests" "$total_tests" "$COLOR_RESET" >&2
+    else
+        printf '%b%d of %d tests succeeded%b\n' "$COLOR_GREEN" "$passed_tests" "$total_tests" "$COLOR_RESET" >&2
+        printf '%b%d self-tests failed%b\n' "$COLOR_RED" "$failed_tests" "$COLOR_RESET" >&2
+        exit "$EXIT_ERROR"
+    fi
+    exit "$EXIT_OK"
+}
+
+# ==============================================================================
+# Dispatch & Main
+# ==============================================================================
+
+dispatch() {
+    local cmd="${1:-}"
+    shift || true
+    log_debug "Entering dispatch with cmd: $cmd"
+    case "$cmd" in
+        help) print_help_top ;;
+        version) printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION" ;;
+        event)
+            parse_event_args "$@"
+            if [[ $SHOW_HELP -eq 1 ]]; then
+                print_help_event
+                return 0
+            fi
+            cmd_event
+            ;;
+        timestamp)
+            parse_timestamp_args "$@"
+            if [[ $SHOW_HELP -eq 1 ]]; then
+                print_help_timestamp
+                return 0
+            fi
+            cmd_timestamp
+            ;;
+        self-test)
+            for arg in "$@"; do
+                if [[ "$arg" == "-h" || "$arg" == "--help" || "$arg" == "help" ]]; then
+                    SHOW_HELP=1
+                    break
+                fi
+            done
+            [[ $SHOW_HELP -eq 1 ]] && { print_help_self_test; return 0; }
+            run_self_test
+            ;;
+        key)
+            parse_key_args "$@"
+            if [[ $SHOW_HELP -eq 1 ]]; then
+                if [[ "$HELP_LEVEL" == "verb" ]]; then $HELP_FUNC; else print_help_key; fi
+                return 0
+            fi
+            case "$VERB" in
+                generate) cmd_key_generate ;;
+                convert-nsec-to-hex) require_nsec; cmd_key_convert_nsec_to_hex ;;
+                convert-npub-to-hex) require_npub; cmd_key_convert_npub_to_hex ;;
+                convert-hex-to-nsec) require_hex; cmd_key_convert_hex_to_nsec ;;
+                convert-hex-to-npub) require_hex; cmd_key_convert_hex_to_npub ;;
+                derive-npub) require_nsec; cmd_key_derive_npub ;;
+                derive-public-hex) require_nsec; cmd_key_derive_public_hex ;;
+            esac
+            ;;
+        profile)
+            parse_profile_args "$@"
+            if [[ $SHOW_HELP -eq 1 ]]; then
+                if [[ "$HELP_LEVEL" == "verb" ]]; then $HELP_FUNC; else print_help_profile; fi
+                return 0
+            fi
+            case "$VERB" in
+                get) cmd_profile_get ;;
+                set) cmd_profile_set ;;
+            esac
+            ;;
+        contact)
+            parse_contact_args "$@"
+            if [[ $SHOW_HELP -eq 1 ]]; then
+                if [[ "$HELP_LEVEL" == "verb" ]]; then $HELP_FUNC; else print_help_contact; fi
+                return 0
+            fi
+            case "$VERB" in
+                send) cmd_contact_send ;;
+                get) cmd_contact_get ;;
+                listen) cmd_contact_listen ;;
+            esac
+            ;;
+        private-group)
+            parse_group_args private-group "$@"
+            if [[ $SHOW_HELP -eq 1 ]]; then
+                if [[ "$HELP_LEVEL" == "verb" ]]; then
+                    $HELP_FUNC
+                else
+                    print_help_private_group
+                fi
+                return 0
+            fi
+            case "$VERB" in
+                send) cmd_private_group_send ;;
+                get) cmd_private_group_get ;;
+                listen) cmd_private_group_listen ;;
+            esac
+            ;;
+        open-group|closed-group)
+            parse_nip29_args "$cmd" "$@"
+            if [[ $SHOW_HELP -eq 1 ]]; then
+                if [[ "$HELP_LEVEL" == "verb" ]]; then
+                    $HELP_FUNC "$cmd"
+                else
+                    print_help_nip29 "$cmd"
+                fi
+                return 0
+            fi
+            case "$VERB" in
+                send) cmd_nip29_send "${cmd%-group}" ;;
+                get) cmd_nip29_get "${cmd%-group}" ;;
+                listen) cmd_nip29_listen "${cmd%-group}" ;;
+            esac
+            ;;
+        public-channel)
+            parse_public_channel_args "$@"
+            if [[ $SHOW_HELP -eq 1 ]]; then
+                if [[ "$HELP_LEVEL" == "verb" ]]; then
+                    $HELP_FUNC
+                else
+                    print_help_public_channel
+                fi
+                return 0
+            fi
+            case "$VERB" in
+                send) cmd_public_channel_send ;;
+                get) cmd_public_channel_get ;;
+                listen) cmd_public_channel_listen ;;
+            esac
+            ;;
+        post)
+            parse_post_args "$@"
+            if [[ $SHOW_HELP -eq 1 ]]; then
+                if [[ "$HELP_LEVEL" == "verb" ]]; then $HELP_FUNC; else print_help_post; fi
+                return 0
+            fi
+            case "$VERB" in
+                send) cmd_post_send ;;
+                get) cmd_post_get ;;
+                listen) cmd_post_listen ;;
+            esac
+            ;;
+        "")
+            print_help_top
+            ;;
+        *)
+            usage_error "Unknown command: ${cmd:-<none>}"
+            ;;
+    esac
+    log_debug "Exiting dispatch"
+}
+
+main() {
+    log_debug "========= Starting main ========="
+    setup_colors
+    require_bash4_if_needed
+    parse_global_args "$@"
+    [[ $SHOW_HELP -eq 1 ]] && { print_help_top; return 0; }
+    [[ $SHOW_VERSION -eq 1 ]] && { printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"; return 0; }
+    if [[ -z "$TOP_COMMAND" ]]; then
+        print_help_top
+        return 0
+    fi
+    validate_explicit_configs
+    load_configs
+    if [[ "$TOP_COMMAND" != "help" && "$TOP_COMMAND" != "version" ]]; then
+        check_dependencies
+    fi
+    if [[ ${#COMMAND_REST[@]} -eq 0 ]]; then
+        if [[ "$TOP_COMMAND" == "help" ]]; then
+            print_help_top
+            return 0
+        elif [[ "$TOP_COMMAND" == "version" ]]; then
+            printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+            return 0
+        elif [[ "$TOP_COMMAND" == "self-test" ]]; then
+            dispatch "$TOP_COMMAND"
+            return 0
+        else
+            dispatch "$TOP_COMMAND" "--help"
+            return 0
+        fi
+    fi
+    dispatch "$TOP_COMMAND" "${COMMAND_REST[@]}"
+    log_debug "========= Exiting main ========="
+}
+
+main "$@"
