@@ -4,7 +4,7 @@ A simple CLI tool for the Nostr chat app `0xchat`.
 
 # Summery
 
-`0xchat-cli` is a simple CLI tool for the Nostr chat app `0xchat`  
+`0xchat-cli` is a simple CLI tool for the Nostr chat app `0xchat` 
 ([www.0xchat.com](https://www.0xchat.com/) and [github.com/0xchat-app](https://github.com/0xchat-app)).
 It is intended to be used as a companion CLI, an admin app, a bot tool, or an AI access point to the
 `0xchat` app.
