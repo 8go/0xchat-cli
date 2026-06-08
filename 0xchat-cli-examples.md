@@ -129,7 +129,55 @@ $ 0xchat-cli private-group get \
     --relay wss://relay.damus.io
 ```
 
-## 6. Public Posts (Notes)
+## 6. Open Groups (NIP-29 Groups)
+Send and receive unencrypted open group messages.
+
+**Scenario A: Using `open-closed-groups.sh` Config (Recommended)**
+When the config files are present, `--group-name` selects the group.
+
+```bash
+# Send a message to the "Surf" group defined in open-closed-groups.sh
+$ 0xchat-cli open-group send \
+    --group-name "Surf" \
+    --text "How are the waves today?"
+
+# Fetch messages from the "Surf" group from yesterday
+$ 0xchat-cli open-group get \
+    --group-name "Surf" \
+    --since "yesterday"
+
+# Listen to the next 2 messages from the "Surf" group starting now
+$ 0xchat-cli open-group listen \
+    --group-name "Surf" \
+    --limit 2
+```
+
+
+## 7. Closed Groups (NIP-29 Groups)
+Send and receive unencrypted closed group messages.
+
+**Scenario A: Using `open-closed-groups.sh` Config (Recommended)**
+When the config files are present, `--group-name` selects the group.
+
+```bash
+# Send a message to the "BBQ Party" group defined in open-closed-groups.sh
+$ 0xchat-cli closed-group send \
+    --group-name "BBQ Party" \
+    --text "Who is bringing the meat?"
+
+# Fetch messages from the "BBQ Party" group for the last 2 weeks
+$ 0xchat-cli closed-group get \
+    --group-name "BBQ Party" \
+    --since "last week"
+
+# Listen to the next 2 messages from the "BBQ Party" group starting tomorrow
+$ 0xchat-cli closed-group listen \
+    --group-name "BBQ Party" \
+    --limit 2
+    --since "tomorrow"
+```
+
+## 8. Public Posts (Notes)
 Publish and fetch Nostr Kind 1 public notes.
 
 ```bash
@@ -146,7 +194,7 @@ $ 0xchat-cli post get --npub me --relay wss://relay.damus.io
 $ 0xchat-cli post get --since "24 hours ago" --relay wss://relay.damus.io
 ```
 
-## 7. Advanced / AI Agent Workflows
+## 9. Advanced / AI Agent Workflows
 
 ### A. Fully Automated AI Responder (Native `--exec`)
 Instead of a manual polling loop, use the native `--exec` feature available on all `listen` commands. This streams events in real-time and executes your script in the background for each message, preventing blocking.
