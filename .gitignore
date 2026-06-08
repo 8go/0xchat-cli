@@ -1,3 +1,7 @@
-/node_modules/
-/lib/
-.bsb.lock
+0xchat-cli-backup*/
+*.7z
+TODO
+backup*
+old*
+backup*/
+old*/
